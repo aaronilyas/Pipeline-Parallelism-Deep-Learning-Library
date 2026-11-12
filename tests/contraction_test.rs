@@ -12,6 +12,9 @@
 //! The `bench_*` and `sweep_*` tests are `#[ignore]`d: run them under the exclusive GPU
 //! lock with `-- --ignored --nocapture --test-threads=1`.
 
+// MPS is reached through `msg_send!`, whose expansion references a cfg this crate does not own.
+#![allow(unexpected_cfgs)]
+
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::time::Instant;
