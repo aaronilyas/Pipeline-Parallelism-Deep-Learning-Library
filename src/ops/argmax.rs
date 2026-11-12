@@ -57,15 +57,19 @@ pub enum Magnitude {
     /// `|re| + |im|`, computed in `f32` (saturates to `+inf` on overflow).
     /// Subnormal parts are included; they are not flushed to zero.
     L1,
-    /// `max · sqrt(1 + (min/max)²)` with `max = max(|re|, |im|)`, computed in `f32`.
+    /// The modulus `sqrt(re² + im²)`, correctly rounded to `f32` (round to nearest, ties to
+    /// even), so the key is within 0.5 ULP of the exact modulus and the selected element's
+    /// modulus is within 1 `f32` ULP of the true maximum, near-ties included.
+    /// Overflow-safe: it is finite whenever the rounded modulus fits in `f32`, saturates to
+    /// `+inf` otherwise, and is `+inf` if either part is infinite.
     /// Subnormal parts are included; they are not flushed to zero.
     Hypot,
 }
 
-/// Launch parameters; mirrors `Params` in `shaders/argmax.metal` field for field.
+/// Launch parameters; mirrors `ArgmaxParams` in `shaders/argmax.metal` field for field.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Params {
+struct ArgmaxParams {
     offset: u64,
     stride: u64,
     out_offset: u64,
@@ -183,7 +187,7 @@ fn encode<T>(
     } else {
         len.div_ceil(THREADGROUP_SIZE * ITEMS_PER_THREAD).clamp(1, MAX_GROUPS)
     };
-    let mut params = Params {
+    let mut params = ArgmaxParams {
         offset: x.offset as u64,
         stride: x.strides[0] as u64,
         out_offset: out.offset as u64,
@@ -199,7 +203,11 @@ fn encode<T>(
     encoder.set_compute_pipeline_state(&first);
     encoder.set_buffer(0, Some(x.buffer), 0);
     encoder.set_buffer(1, Some(scratch.as_deref().unwrap_or(out.buffer)), 0);
-    encoder.set_bytes(2, size_of::<Params>() as u64, (&mut params as *mut Params).cast());
+    encoder.set_bytes(
+        2,
+        size_of::<ArgmaxParams>() as u64,
+        (&mut params as *mut ArgmaxParams).cast(),
+    );
     let threads = MTLSize::new(THREADGROUP_SIZE as u64, 1, 1);
     encoder.dispatch_thread_groups(MTLSize::new(groups as u64, 1, 1), threads);
     if let (Some(last), Some(scratch)) = (last, scratch.as_deref()) {

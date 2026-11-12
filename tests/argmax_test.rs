@@ -48,8 +48,102 @@ fn ref_argmax(x: &[f32]) -> usize {
     ref_best(x.iter().map(|v| v.abs()))
 }
 
+/// Sign-stripped bits of `+inf`, of the smallest normal, and the fraction-field mask.
+const INF_BITS: u32 = 0x7f80_0000;
+const MIN_NORMAL_BITS: u32 = 0x0080_0000;
+const FRACTION_MASK: u32 = 0x007f_ffff;
+
+/// Mirror of `kHypotMaxSteps` in `shaders/argmax.metal`.
+const HYPOT_MAX_STEPS: u32 = 6;
+
+/// Mirror of `hypot_round_exact` in `shaders/argmax.metal`: steps the candidate `est` (float
+/// bits in `[1, 4)`) one ULP at a time until exact 64-bit midpoint tests accept it.
+fn hypot_round_exact(mut est: u32, sig_a: u32, sig_b: u32, gap: u32) -> u32 {
+    let x = u64::from(sig_a) << (gap + 1);
+    let y = u64::from(sig_b) << 1;
+    let sum = x.wrapping_mul(x).wrapping_add(y.wrapping_mul(y));
+    for _ in 0..HYPOT_MAX_STEPS {
+        let q = MIN_NORMAL_BITS | (est & FRACTION_MASK);
+        let s = (est >> 23) - 126 + gap;
+        let big = u64::from(q) << s;
+        let r4 = (sum.wrapping_sub(big.wrapping_mul(big)) << 2) as i64;
+        let odd = q & 1 == 1;
+        let above = r4 - (big << (s + 2)) as i64 - (1i64 << (2 * s));
+        let s_below = if q == MIN_NORMAL_BITS { s - 1 } else { s };
+        let below = r4 + (big << (s_below + 2)) as i64 - (1i64 << (2 * s_below));
+        if above > 0 || (above == 0 && odd) {
+            est += 1;
+        } else if below < 0 || (below == 0 && odd) {
+            est -= 1;
+        } else {
+            break;
+        }
+    }
+    est
+}
+
+/// Bits of the correctly rounded `f32` modulus of two non-NaN magnitudes given by their
+/// sign-stripped bits. This mirrors `hypot_key` in `shaders/argmax.metal` step for step:
+/// a float estimate from exactly scaled normal operands, a 32-bit integer certificate that
+/// accepts the estimate or one of its neighbours, and exact 64-bit midpoint tests (ties to
+/// even) for whatever the certificate cannot decide.
+fn hypot_bits(re: u32, im: u32) -> u32 {
+    let (a, b) = (re.max(im), re.min(im));
+    if a == INF_BITS {
+        return INF_BITS;
+    }
+    if b == 0 {
+        return a;
+    }
+    if a < MIN_NORMAL_BITS {
+        // Both subnormal: the nearest integer to sqrt(a² + b²) in units of 2^-149.
+        let sum = u64::from(a) * u64::from(a) + u64::from(b) * u64::from(b);
+        let mut q = (sum as f32).sqrt() as u64;
+        for _ in 0..HYPOT_MAX_STEPS {
+            if sum > q * q + q {
+                q += 1;
+            } else if sum <= q * q - q {
+                q -= 1;
+            } else {
+                break;
+            }
+        }
+        return q as u32;
+    }
+    let exp_a = a >> 23;
+    let gap = exp_a - (b >> 23).max(1);
+    if gap > 12 {
+        return a;
+    }
+    let sig_a = MIN_NORMAL_BITS | (a & FRACTION_MASK);
+    let sig_b = if b >= MIN_NORMAL_BITS { MIN_NORMAL_BITS | (b & FRACTION_MASK) } else { b };
+
+    let fa = f32::from_bits(0x3f80_0000 | (a & FRACTION_MASK));
+    let fb = sig_b as f32 * f32::from_bits((104 - gap) << 23);
+    let mut est = (fa * fa + fb * fb).sqrt().to_bits().clamp(0x3f80_0000, 0x407f_ffff);
+
+    let q = MIN_NORMAL_BITS | (est & FRACTION_MASK);
+    let e2 = 2 * ((est >> 23) - 127);
+    let lo_term = ((u64::from(sig_b) * u64::from(sig_b)) >> (2 * gap)) as u32;
+    let r = sig_a.wrapping_mul(sig_a).wrapping_add(lo_term).wrapping_sub(q.wrapping_mul(q) << e2)
+        as i32;
+    let w = (q << e2) as i32;
+    let pow2 = q == MIN_NORMAL_BITS;
+    if r >= (if pow2 { 0 } else { 2 - w }) && r < w {
+        // est is already correctly rounded.
+    } else if r >= w + 2 && r < 3 * w {
+        est += 1;
+    } else if !pow2 && r < -w && r >= (if q == MIN_NORMAL_BITS + 1 { -2 * w } else { 10 - 3 * w }) {
+        est -= 1;
+    } else {
+        est = hypot_round_exact(est, sig_a, sig_b, gap);
+    }
+    ((est - 0x3f80_0000) + (exp_a << 23)).min(INF_BITS)
+}
+
 /// The `f32` complex magnitude formulas shared with the kernel. Subnormals participate;
-/// the host arithmetic is IEEE, and the kernel matches it without flush-to-zero.
+/// the host arithmetic is IEEE, and the kernel matches it without flush-to-zero. Hypot is
+/// the correctly rounded modulus (see [`hypot_bits`]).
 fn mag32(z: [f32; 2], kind: Magnitude) -> f32 {
     let (re, im) = (z[0].abs(), z[1].abs());
     if re.is_nan() || im.is_nan() {
@@ -57,17 +151,7 @@ fn mag32(z: [f32; 2], kind: Magnitude) -> f32 {
     }
     match kind {
         Magnitude::L1 => re + im,
-        Magnitude::Hypot => {
-            let (hi, lo) = (re.max(im), re.min(im));
-            if hi == 0.0 {
-                0.0
-            } else if hi.is_infinite() {
-                f32::INFINITY
-            } else {
-                let r = lo / hi;
-                hi * r.mul_add(r, 1.0).sqrt()
-            }
-        }
+        Magnitude::Hypot => f32::from_bits(hypot_bits(re.to_bits(), im.to_bits())),
     }
 }
 
@@ -1145,14 +1229,287 @@ fn audit_hypot_pick_is_within_one_ulp_of_f64_max_on_near_ties() {
         let got = unsafe { std::slice::from_raw_parts(outs.contents() as *const u32, pairs) };
         for i in 0..pairs {
             let (z, w) = (data[2 * i], data[2 * i + 1]);
-            let want = ref_best([mag32(z, Magnitude::Hypot), mag32(w, Magnitude::Hypot)].into_iter());
+            let want =
+                ref_best([mag32(z, Magnitude::Hypot), mag32(w, Magnitude::Hypot)].into_iter());
             let tmax = m64(z).max(m64(w)) as f32;
             let picked = m64([z, w][got[i] as usize]) as f32;
             let ulps = (i64::from(tmax.to_bits()) - i64::from(picked.to_bits())).unsigned_abs();
             if ulps > 1 || got[i] as usize != want {
-                bad.push(format!("z={z:?} w={w:?}: got {} (reference {want}), {ulps} ULP below the f64 max", got[i]));
+                bad.push(format!(
+                    "z={z:?} w={w:?}: got {} (reference {want}), {ulps} ULP below the f64 max",
+                    got[i]
+                ));
             }
         }
     }
-    assert!(bad.is_empty(), "{} near-tie violations, first: {:#?}", bad.len(), &bad[..bad.len().min(5)]);
+    assert!(
+        bad.is_empty(),
+        "{} near-tie violations, first: {:#?}",
+        bad.len(),
+        &bad[..bad.len().min(5)]
+    );
+}
+
+// --- Hypot key: exactness of the reference and bit equality with the kernel -------------
+
+/// Floor of the square root of `n`.
+fn isqrt(n: u128) -> u128 {
+    let mut r = (n as f64).sqrt() as u128;
+    while r * r > n {
+        r -= 1;
+    }
+    while (r + 1) * (r + 1) <= n {
+        r += 1;
+    }
+    r
+}
+
+/// Exact oracle, independent of [`hypot_bits`]: bits of `sqrt(re² + im²)` rounded to nearest
+/// (ties to even) from the exact 128-bit integer sum of squares. Inputs are the bits of
+/// finite non-negative values.
+fn hypot_bits_exact(re: u32, im: u32) -> u32 {
+    let (a, b) = (re.max(im), re.min(im));
+    let parts = |v: u32| {
+        if v >= MIN_NORMAL_BITS {
+            (u128::from(MIN_NORMAL_BITS | (v & FRACTION_MASK)), v >> 23)
+        } else {
+            (u128::from(v), 1)
+        }
+    };
+    let ((sig_a, exp_a), (sig_b, exp_b)) = (parts(a), parts(b));
+    let gap = exp_a - exp_b;
+    if gap > 30 {
+        // lo/hi < 2^-29: the modulus exceeds `hi` by far less than half an ULP.
+        return a;
+    }
+    // Units of 2^(exp_b - 150): the sum of squares is an integer below 2^110.
+    let sum = (sig_a << gap) * (sig_a << gap) + sig_b * sig_b;
+    let root = isqrt(sum);
+    // The result's ULP is 2^drop of these units (never finer than the units themselves).
+    let drop = (128 - root.leading_zeros()).saturating_sub(24);
+    let mut sig = if drop == 0 {
+        root + u128::from(sum > root * root + root)
+    } else {
+        let floor = root >> drop;
+        let midpoint = (floor << drop) + (1 << (drop - 1));
+        match sum.cmp(&(midpoint * midpoint)) {
+            std::cmp::Ordering::Less => floor,
+            std::cmp::Ordering::Greater => floor + 1,
+            std::cmp::Ordering::Equal => floor + (floor & 1),
+        }
+    };
+    let mut exp = exp_b + drop;
+    if sig == 1 << 24 {
+        sig >>= 1;
+        exp += 1;
+    }
+    if sig < 1 << 23 {
+        assert_eq!(exp, 1, "a subnormal result has the subnormal exponent");
+        sig as u32
+    } else if exp >= 255 {
+        INF_BITS
+    } else {
+        (exp << 23) | (sig as u32 & FRACTION_MASK)
+    }
+}
+
+/// Finite complex elements (as sign-stripped bits) that stress the Hypot key: uniform bit
+/// patterns, small exponent gaps, subnormal and mixed parts, sparse and saturated
+/// significands (ties and binade edges), and parts near `f32::MAX`.
+fn hypot_stress_bits(r: &mut ChaCha8Rng, rounds: usize) -> Vec<[u32; 2]> {
+    let mut out = Vec::with_capacity(6 * rounds);
+    let sparse = |r: &mut ChaCha8Rng| {
+        let mut m = 0u32;
+        for _ in 0..r.random_range(0..4) {
+            m |= 1 << r.random_range(0..23);
+        }
+        if r.random_bool(0.5) {
+            m ^ FRACTION_MASK
+        } else {
+            m
+        }
+    };
+    for _ in 0..rounds {
+        out.push([r.random_range(0..INF_BITS), r.random_range(0..INF_BITS)]);
+        let exp_a = r.random_range(1..255u32);
+        let exp_b = exp_a.saturating_sub(r.random_range(0..15));
+        out.push([
+            (exp_a << 23) | r.random_range(0..=FRACTION_MASK),
+            (exp_b << 23) | r.random_range(0..=FRACTION_MASK),
+        ]);
+        let (wa, wb) = (r.random_range(1..26u32), r.random_range(1..26u32));
+        out.push([r.random_range(0..1u32 << wa), r.random_range(0..1u32 << wb)]);
+        let exp_a = r.random_range(1..255u32);
+        let exp_b = exp_a.saturating_sub(r.random_range(0..14));
+        out.push([(exp_a << 23) | sparse(r), (exp_b << 23) | sparse(r)]);
+        out.push([
+            (254 << 23) | r.random_range(0..=FRACTION_MASK),
+            (r.random_range(252..255u32) << 23) | r.random_range(0..=FRACTION_MASK),
+        ]);
+        // Nearly equal parts just under an exponent boundary of the modulus.
+        let near = (r.random_range(1..255u32) << 23) | (0x3504f3 + r.random_range(0..64u32) - 32);
+        out.push([near, near + r.random_range(0..64u32) - 32]);
+    }
+    out
+}
+
+/// Primitive Pythagorean triples `p² + q² = c²` with `c` odd in `[2^24, 2^25)`: `c` needs 25
+/// bits, so the exact modulus of `(p, q)` lies half way between two `f32` values. Each is
+/// returned at several power-of-two scales, from subnormal results to results near overflow.
+fn hypot_exact_ties(limit: usize) -> Vec<[u32; 2]> {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    let mut out = Vec::new();
+    'search: for m in 2900u64..5793 {
+        for k in (1 + (m & 1)..m).step_by(2) {
+            let (c, p, q) = (m * m + k * k, m * m - k * k, 2 * m * k);
+            let exact = |v: u64| (v as f32) as u64 == v;
+            if (1 << 24..1 << 25).contains(&c) && gcd(m, k) == 1 && exact(p) && exact(q) {
+                for scale in [-150i32, -140, -100, -24, 0, 50, 102] {
+                    let s = 2f32.powi(scale);
+                    out.push([(p as f32 * s).to_bits(), (q as f32 * s).to_bits()]);
+                }
+                if out.len() >= limit {
+                    break 'search;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Hand-picked extremes: zeros, the smallest and largest subnormals, the smallest normal,
+/// `f32::MAX`, and infinities in every pairing, plus the overflow boundary of the modulus.
+fn hypot_extremes() -> Vec<[u32; 2]> {
+    let max = f32::MAX.to_bits();
+    let edge = [0, 1, 2, 3, 0x7f_ffff, MIN_NORMAL_BITS, MIN_NORMAL_BITS + 1, 0x3f80_0000];
+    let top = [max - 1, max, INF_BITS];
+    let mut out = Vec::new();
+    for &a in edge.iter().chain(&top) {
+        for &b in edge.iter().chain(&top) {
+            out.push([a, b]);
+        }
+    }
+    // sqrt(MAX² + b²) crosses the last midpoint below 2^128 as b grows through 2^116.
+    for b in (0x7980_0000u32 - 40)..(0x7980_0000 + 40) {
+        out.push([max, b]);
+        out.push([b, max - 1]);
+    }
+    out
+}
+
+/// Asserts that the kernel's Hypot key of every element equals the reference key bit for
+/// bit, and returns the number of elements checked.
+///
+/// The key is observed through the public API: with `k` the reference modulus, the purely
+/// real element `(k, 0)` has key `k` exactly, so the two-element scan `[(k, 0), z]` returns 0
+/// only if `key(z) <= k`, and `[z, (k, 0)]` returns 0 only if `key(z) >= k`.
+fn assert_hypot_keys_match(ctx: &MetalContext, cases: &[[u32; 2]], what: &str) -> usize {
+    let mut r = rng(41);
+    for chunk in cases.chunks(8192) {
+        let mut data = Vec::with_capacity(3 * chunk.len());
+        for &[re, im] in chunk {
+            // Signs must not matter: flip them at random.
+            let z = [
+                f32::from_bits(re | (u32::from(r.random_bool(0.5)) << 31)),
+                f32::from_bits(im | (u32::from(r.random_bool(0.5)) << 31)),
+            ];
+            let k = [mag32(z, Magnitude::Hypot), 0.0];
+            data.extend([k, z, k]);
+        }
+        let xb = upload(ctx, &data);
+        let outs = alloc_shared::<u32>(ctx, 2 * chunk.len());
+        let cmd = ctx.queue.new_command_buffer();
+        for i in 0..2 * chunk.len() {
+            let x = vector::<[f32; 2]>(&xb, 3 * (i / 2) + i % 2, 2, 1);
+            let out = TensorView::<u32>::row_major(&outs, i, vec![1]);
+            encode_argmax_complex(ctx, cmd, &x, Magnitude::Hypot, &out).unwrap();
+        }
+        cmd.commit();
+        cmd.wait_until_completed();
+        // SAFETY: `outs` holds `2 * chunk.len()` u32s and the command buffer has completed.
+        let got =
+            unsafe { std::slice::from_raw_parts(outs.contents() as *const u32, 2 * chunk.len()) };
+        for (i, &[re, im]) in chunk.iter().enumerate() {
+            assert!(
+                got[2 * i] == 0 && got[2 * i + 1] == 0,
+                "{what}: kernel key of ({re:#010x}, {im:#010x}) is {} the reference {:#010x}",
+                if got[2 * i] != 0 { "above" } else { "below" },
+                hypot_bits(re, im),
+            );
+        }
+    }
+    cases.len()
+}
+
+/// The reference Hypot key is the correctly rounded modulus: it equals the exact integer
+/// oracle on adversarial inputs, exact ties included, and is symmetric in its parts.
+#[test]
+fn hypot_reference_is_correctly_rounded() {
+    let mut r = rng(40);
+    let mut cases = hypot_stress_bits(&mut r, 300_000);
+    cases.extend(hypot_exact_ties(200_000));
+    cases.extend(hypot_extremes().into_iter().filter(|z| z[0] < INF_BITS && z[1] < INF_BITS));
+    for &[re, im] in &cases {
+        let want = hypot_bits_exact(re, im);
+        assert_eq!(hypot_bits(re, im), want, "hypot_bits({re:#010x}, {im:#010x})");
+        assert_eq!(hypot_bits(im, re), want, "hypot_bits({im:#010x}, {re:#010x})");
+        // Within half an f32 ULP of the f64 modulus (which carries its own f64 rounding).
+        if want < f32::MAX.to_bits() {
+            let key = f64::from(f32::from_bits(want));
+            let ulp = f64::from(f32::from_bits(want + 1)) - key;
+            let modulus = f64::from(f32::from_bits(re)).hypot(f64::from(f32::from_bits(im)));
+            let err = (modulus - key).abs() / ulp;
+            assert!(err <= 0.5 + 1e-7, "({re:#010x}, {im:#010x}): {err} ULP from the modulus");
+        }
+    }
+    // The extremes pin the special values directly.
+    assert_eq!(hypot_bits(INF_BITS, 0), INF_BITS);
+    assert_eq!(hypot_bits(1, INF_BITS), INF_BITS);
+    assert_eq!(hypot_bits(0, 0), 0);
+    assert_eq!(hypot_bits(1, 1), 1, "sqrt(2) units of 2^-149 rounds to 1");
+    assert_eq!(hypot_bits(2, 2), 3, "sqrt(8) units of 2^-149 rounds to 3");
+    let max = f32::MAX.to_bits();
+    assert_eq!(hypot_bits(max, max), INF_BITS, "MAX * sqrt(2) overflows");
+    assert_eq!(hypot_bits(max, 0x7900_0000), max, "stays finite below the last midpoint");
+    assert_eq!(mag32([3.0, -4.0], Magnitude::Hypot), 5.0);
+}
+
+/// The kernel's Hypot key equals the reference key bit for bit: subnormal parts (which the
+/// GPU would flush in float arithmetic), exact ties, overflow, and infinities included.
+#[test]
+fn hypot_key_matches_reference_bit_for_bit() {
+    let c = ctx();
+    let mut r = rng(42);
+    assert_hypot_keys_match(&c, &hypot_extremes(), "extremes");
+    assert_hypot_keys_match(&c, &hypot_exact_ties(20_000), "exact ties");
+    assert_hypot_keys_match(&c, &hypot_stress_bits(&mut r, 20_000), "stress");
+}
+
+/// Large version of [`hypot_key_matches_reference_bit_for_bit`], with the reference checked
+/// against the exact oracle on the same inputs.
+#[test]
+#[ignore = "exhaustive: run under the exclusive GPU lock"]
+fn sweep_hypot_key_bits() {
+    let c = ctx();
+    let mut r = rng(43);
+    let started = std::time::Instant::now();
+    let mut checked = 0usize;
+    let ties = hypot_exact_ties(usize::MAX);
+    println!("\nexact-tie inputs: {}", ties.len());
+    for cases in std::iter::once(ties).chain((0..40).map(|_| hypot_stress_bits(&mut r, 50_000))) {
+        for &[re, im] in &cases {
+            assert_eq!(hypot_bits(re, im), hypot_bits_exact(re, im), "({re:#010x}, {im:#010x})");
+        }
+        checked += assert_hypot_keys_match(&c, &cases, "sweep");
+    }
+    println!(
+        "hypot key: {checked} inputs, kernel == reference == exact oracle, 0 mismatches, {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
 }
