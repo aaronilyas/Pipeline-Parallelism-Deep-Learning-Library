@@ -5,6 +5,7 @@
 
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::ops::Range;
 use std::time::Instant;
 
 use half::f16;
@@ -304,7 +305,11 @@ fn slice_keeps_pointer_identity_and_applies_the_offset_formula() {
     assert_eq!(again.element_index(&[1, 2, 3]), parent.element_index(&[1, 3, 3]));
     let nested = slice(&again, &[1..2, 0..2, 1..4]).unwrap();
     assert_eq!(nested.host_ptr, parent.host_ptr);
-    assert_eq!(nested.offset, again.offset + 1 * 40 + 0 * 8 + 1 * 2);
+    // Includes the zero-length axis: 1*40 + 0*8 + 1*2.
+    let starts = [1usize, 0, 1];
+    let added: usize =
+        starts.iter().zip(&again.strides).map(|(start, stride)| start * stride).sum();
+    assert_eq!(nested.offset, again.offset + added);
     assert_eq!(nested.shape, vec![1, 2, 3]);
 
     let scalar = TensorView::<f32>::new(&buf, 6, vec![], vec![]);
@@ -324,9 +329,9 @@ fn slice_rejects_out_of_bounds_inverted_and_rank_mismatch() {
         vec![0..5, 0..6],
         vec![0..4, 0..7],
         vec![4..4, 7..7],
-        vec![3..2, 0..6],
-        vec![0..4, 5..4],
-        vec![0..4],
+        vec![Range { start: 3, end: 2 }, 0..6],
+        vec![0..4, Range { start: 5, end: 4 }],
+        std::iter::once(0..4).collect(),
         vec![0..4, 0..6, 0..1],
         vec![],
     ] {
@@ -751,6 +756,32 @@ fn concat_each_axis_of_rank3_including_empty_blocks() {
     let ev = TensorView::<f32>::row_major(&edst, 0, vec![0, 4]);
     assert_concat("empty", &ctx, &[&e0, &e1], 0, &edst, &ev);
     assert!(buffer_bytes(&edst).iter().all(|&b| b == SENTINEL));
+}
+
+/// Every part slot, including the last and an empty one in the middle.
+#[test]
+fn concat_sixteen_parts_with_an_empty_block() {
+    let ctx = metal_context();
+    let mut bufs = Vec::new();
+    for i in 0..MAX_CONCAT_PARTS {
+        let len = if i == 7 { 0 } else { 1 };
+        let buf = alloc_shared::<f32>(&ctx, len.max(1));
+        fill_indexed(&buf, 30 + i as u8);
+        bufs.push(buf);
+    }
+    let views: Vec<TensorView<f32>> = bufs
+        .iter()
+        .enumerate()
+        .map(|(i, buf)| {
+            let len = if i == 7 { 0 } else { 1 };
+            TensorView::<f32>::row_major(buf, 0, vec![len])
+        })
+        .collect();
+    let refs: Vec<_> = views.iter().collect();
+    let dst_buf = alloc_shared::<f32>(&ctx, MAX_CONCAT_PARTS - 1);
+    fill_sentinel(&dst_buf);
+    let dst = TensorView::<f32>::row_major(&dst_buf, 0, vec![MAX_CONCAT_PARTS - 1]);
+    assert_concat("16 parts", &ctx, &refs, 0, &dst_buf, &dst);
 }
 
 // ---------------------------------------------------------------------------------------
