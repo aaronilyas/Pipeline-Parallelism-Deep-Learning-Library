@@ -13,8 +13,25 @@ pub enum Op {
 /// Returns [`Error::Schedule`] when `stages` is 0, `rank >= stages`,
 /// `microbatches` is 0, or `microbatches > u32::MAX`.
 pub fn local_order(stages: usize, rank: usize, microbatches: usize) -> Result<Vec<Op>, Error> {
-    let _ = (stages, rank, microbatches);
-    Ok(Vec::new())
+    if stages == 0 || rank >= stages || microbatches == 0 || microbatches > u32::MAX as usize {
+        return Err(Error::Schedule);
+    }
+    let m = microbatches;
+    let w = stages - rank - 1;
+    let warmup = w.min(m);
+    let steady = m - warmup;
+    let mut out = Vec::with_capacity(2 * m);
+    for i in 0..warmup {
+        out.push(Op::Forward(i as u32));
+    }
+    for i in 0..steady {
+        out.push(Op::Forward((warmup + i) as u32));
+        out.push(Op::Backward(i as u32));
+    }
+    for i in steady..m {
+        out.push(Op::Backward(i as u32));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -143,7 +160,9 @@ mod tests {
         for stages in 1..=5 {
             for rank in 0..stages {
                 let w = stages - rank - 1;
-                for m in (w + 1)..=8 {
+                // Steady length is M - min(w, M). An F follows the first B only when
+                // steady >= 2, i.e. M > w + 1.
+                for m in (w + 2)..=8 {
                     let order = local_order(stages, rank, m).unwrap();
                     let first_b = order
                         .iter()
@@ -153,7 +172,7 @@ mod tests {
                         order[first_b + 1..].iter().any(|op| matches!(op, Op::Forward(_)));
                     assert!(
                         has_f_after,
-                        "expected some F after first B when M > w; stages={stages} rank={rank} m={m}"
+                        "expected some F after first B when M > w+1; stages={stages} rank={rank} m={m}"
                     );
                 }
             }
