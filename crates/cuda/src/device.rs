@@ -36,7 +36,9 @@ struct DeviceBuf {
 }
 
 // SAFETY: `DeviceBuf` uniquely owns one `CudaSlice`. Moving it moves that owner.
-// No method on `&DeviceBuf` forms a Rust reference into device memory.
+// No method on `&DeviceBuf` forms a Rust reference into device memory. Core's
+// caller obligation: no thread reads or writes a storage_id while another call
+// writes it.
 unsafe impl Send for DeviceBuf {}
 
 // SAFETY: Sharing is sound because core's Backend obligation says no thread may
@@ -67,21 +69,48 @@ pub struct CudaBackend {
     stats: Mutex<Stats>,
 }
 
+/// True when the CUDA driver, cuBLAS, and NVRTC libraries can be loaded.
+pub(crate) fn cuda_libs_present() -> bool {
+    // SAFETY: `is_culib_present` only probes `libloading`; it does not call into CUDA.
+    unsafe {
+        cudarc::driver::sys::is_culib_present()
+            && cudarc::cublas::sys::is_culib_present()
+            && cudarc::nvrtc::sys::is_culib_present()
+    }
+}
+
+/// Maps a panicking CUDA init to [`Error::UnsupportedDevice`].
+pub(crate) fn map_cuda_init_panic<T>(
+    caught: Result<Result<T, Error>, Box<dyn std::any::Any + Send>>,
+) -> Result<T, Error> {
+    match caught {
+        Ok(inner) => inner,
+        Err(_) => Err(Error::UnsupportedDevice),
+    }
+}
+
 impl CudaBackend {
     pub fn new() -> Result<Self, Error> {
+        if !cuda_libs_present() {
+            return Err(Error::UnsupportedDevice);
+        }
+        map_cuda_init_panic(std::panic::catch_unwind(std::panic::AssertUnwindSafe(Self::new_inner)))
+    }
+
+    fn new_inner() -> Result<Self, Error> {
         let ctx = CudaContext::new(0).map_err(|_| Error::UnsupportedDevice)?;
         let stream = ctx.default_stream();
-        let blas = CudaBlas::new(stream.clone()).map_err(|_| Error::Schedule)?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|_| Error::UnsupportedDevice)?;
 
         let ptx = compile_ptx_with_opts(
             GELU_SRC,
             CompileOptions { arch: Some("compute_61"), ..Default::default() },
         )
-        .map_err(|_| Error::Schedule)?;
-        let module = ctx.load_module(ptx).map_err(|_| Error::Schedule)?;
-        let gelu = module.load_function("gelu_kernel").map_err(|_| Error::Schedule)?;
+        .map_err(|_| Error::UnsupportedDevice)?;
+        let module = ctx.load_module(ptx).map_err(|_| Error::UnsupportedDevice)?;
+        let gelu = module.load_function("gelu_kernel").map_err(|_| Error::UnsupportedDevice)?;
         let gelu_backward =
-            module.load_function("gelu_backward_kernel").map_err(|_| Error::Schedule)?;
+            module.load_function("gelu_backward_kernel").map_err(|_| Error::UnsupportedDevice)?;
 
         Ok(Self {
             stream,
@@ -171,6 +200,8 @@ impl Backend for CudaBackend {
             return Err(Error::Dtype);
         }
         let alloc_len = nbytes.max(1);
+        // SAFETY: `alloc_len` is at least 1 and matches the host payload we copy
+        // or zero below; the slice is exclusively owned until wrapped in `CudaStore`.
         let mut slice =
             unsafe { self.stream.alloc::<u8>(alloc_len) }.map_err(|_| Error::Schedule)?;
         if nbytes > 0 {
@@ -267,55 +298,57 @@ impl Backend for CudaBackend {
             }
         }
 
-        // K==0 with beta==0: cuBLAS may skip writing C. One device memset zeros C.
-        if k == 0 && beta == 0.0 {
-            if c_bytes > 0 {
-                // SAFETY: exclusive write to `c` under Backend's caller obligation;
-                // `ptr`/`c_bytes` describe the live allocation.
-                unsafe {
-                    cudarc::driver::result::memset_d8_async(
-                        c.storage.buf.ptr,
-                        0,
-                        c_bytes,
-                        self.stream.cu_stream(),
-                    )
-                }
-                .map_err(|_| Error::Schedule)?;
-            }
-            self.record("gemm-f32-cublas");
+        // Empty output: nothing to write and no cuBLAS launch.
+        if m == 0 || n == 0 {
             return Ok(());
         }
 
+        // alpha == 0 must not reference A or B: pass k = 0 to cuBLAS.
+        let k_eff = if alpha == 0.0 { 0 } else { k };
+
         // Row-major C = A B via column-major identity C^T = B^T A^T: one sgemm
         // with operands swapped. A transpose_matrix view is an OP_T flag.
+        // Leading dims satisfy ld ≥ max(1, rows) even for zero extents.
         let (trans_b, ldb) = match b_layout {
-            MatrixLayout::RowMajor => (cublas_sys::cublasOperation_t::CUBLAS_OP_N, n as i32),
-            MatrixLayout::Transposed => (cublas_sys::cublasOperation_t::CUBLAS_OP_T, k as i32),
+            MatrixLayout::RowMajor => (cublas_sys::cublasOperation_t::CUBLAS_OP_N, n.max(1)),
+            MatrixLayout::Transposed => (cublas_sys::cublasOperation_t::CUBLAS_OP_T, k.max(1)),
         };
         let (trans_a, lda) = match a_layout {
-            MatrixLayout::RowMajor => (cublas_sys::cublasOperation_t::CUBLAS_OP_N, k as i32),
-            MatrixLayout::Transposed => (cublas_sys::cublasOperation_t::CUBLAS_OP_T, m as i32),
+            MatrixLayout::RowMajor => (cublas_sys::cublasOperation_t::CUBLAS_OP_N, k.max(1)),
+            MatrixLayout::Transposed => (cublas_sys::cublasOperation_t::CUBLAS_OP_T, m.max(1)),
         };
+        let ldc = n.max(1);
+
+        let m_i = i32_dim(m)?;
+        let n_i = i32_dim(n)?;
+        let k_i = i32_dim(k_eff)?;
+        let lda_i = i32_dim(lda)?;
+        let ldb_i = i32_dim(ldb)?;
+        let ldc_i = i32_dim(ldc)?;
+
+        // Worker threads that did not run `new` must bind the context first.
+        self.stream.context().bind_to_thread().map_err(|_| Error::Schedule)?;
 
         // SAFETY: pointers are live device allocations for a/b/c; dims/ld match
         // the layouts above; Backend callers do not race writes on these ids.
-        // cuBLAS with beta==0 does not read C (NaN-safe).
+        // cuBLAS with beta==0 does not read C (NaN-safe). With alpha==0, k_eff
+        // is 0 so A and B are not referenced.
         unsafe {
             cublas_result::sgemm(
                 *self.blas.handle(),
                 trans_b,
                 trans_a,
-                n as i32,
-                m as i32,
-                k as i32,
+                n_i,
+                m_i,
+                k_i,
                 &alpha,
                 b.storage.buf.ptr as *const f32,
-                ldb,
+                ldb_i,
                 a.storage.buf.ptr as *const f32,
-                lda,
+                lda_i,
                 &beta,
                 c.storage.buf.ptr as *mut f32,
-                n as i32,
+                ldc_i,
             )
         }
         .map_err(|_| Error::Schedule)?;
@@ -424,6 +457,10 @@ fn checked_nbytes(dtype: DType, shape: &[usize]) -> Result<usize, Error> {
         numel = numel.checked_mul(extent).ok_or(Error::Shape)?;
     }
     numel.checked_mul(dtype.size_of()).ok_or(Error::Shape)
+}
+
+fn i32_dim(value: usize) -> Result<i32, Error> {
+    i32::try_from(value).map_err(|_| Error::Shape)
 }
 
 fn matrix_dims(tensor: &Tensor<CudaStore>) -> Result<(usize, usize), Error> {

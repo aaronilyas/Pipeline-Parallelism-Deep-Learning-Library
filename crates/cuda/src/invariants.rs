@@ -195,6 +195,7 @@ fn gelu_does_not_download() {
     let before = backend.debug_downloads();
     backend.gelu(&x, &mut y).unwrap();
     assert_eq!(backend.debug_downloads(), before, "gelu must not download to the host");
+    assert_eq!(backend.debug_launches(), vec!["gelu-cuda"]);
     let got = f32_values(&backend.download(&y).unwrap());
     for (index, (&g, &xv)) in got.iter().zip(&xs).enumerate() {
         let expected = 0.5 * xv * (1.0 + erf_ref(xv / std::f32::consts::SQRT_2));
@@ -300,7 +301,7 @@ fn gelu_backward_within_1e_5() {
     let dy = upload_f32(&backend, &[xs.len()], &dys);
     let mut dx = backend.alloc(DType::F32, &[xs.len()]).unwrap();
     backend.gelu_backward(&pre, &dy, &mut dx).unwrap();
-    assert_eq!(backend.debug_launches().last().copied(), Some("gelu-backward-cuda"));
+    assert_eq!(backend.debug_launches(), vec!["gelu-backward-cuda"]);
     let got = f32_values(&backend.download(&dx).unwrap());
     for (index, ((&g, &x), &dyv)) in got.iter().zip(&xs).zip(&dys).enumerate() {
         let expected = dyv * gelu_prime_ref(x);
@@ -337,4 +338,109 @@ fn empty_tensor_row_major_strides() {
     let backend = require_device();
     let t = backend.alloc(DType::F32, &[2, 0]).unwrap();
     assert_eq!(t.strides, row_major_strides(&[2, 0]));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gemm_and_gelu_from_spawned_thread() {
+    use std::sync::Arc;
+    let backend = Arc::new(require_device());
+    let backend_thread = Arc::clone(&backend);
+    let join = std::thread::spawn(move || {
+        let a = upload_f32(&backend_thread, &[2, 2], &[1.0, 0.0, 0.0, 1.0]);
+        let b = upload_f32(&backend_thread, &[2, 2], &[2.0, 3.0, 4.0, 5.0]);
+        let mut c = upload_f32(&backend_thread, &[2, 2], &[0.0; 4]);
+        backend_thread.gemm(&a, &b, &mut c, 1.0, 0.0).unwrap();
+        let got = f32_values(&backend_thread.download(&c).unwrap());
+        assert_eq!(got, vec![2.0, 3.0, 4.0, 5.0]);
+
+        let x = upload_f32(&backend_thread, &[1], &[0.0]);
+        let mut y = backend_thread.alloc(DType::F32, &[1]).unwrap();
+        backend_thread.gelu(&x, &mut y).unwrap();
+        let yg = f32_values(&backend_thread.download(&y).unwrap());
+        assert!((yg[0]).abs() <= 1e-5, "gelu(0) from worker thread: got {}", yg[0]);
+    });
+    join.join().expect("worker thread panicked");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn alpha_zero_does_not_read_a_or_b() {
+    let backend = require_device();
+    let nan = f32::NAN;
+    let a = upload_f32(&backend, &[2, 2], &[nan; 4]);
+    let b = upload_f32(&backend, &[2, 2], &[nan; 4]);
+
+    let mut c = upload_f32(&backend, &[2, 2], &[nan; 4]);
+    backend.gemm(&a, &b, &mut c, 0.0, 0.0).unwrap();
+    let got = f32_values(&backend.download(&c).unwrap());
+    assert_eq!(got, vec![0.0; 4]);
+
+    let c0 = [1.5f32, -2.0, 3.25, -4.5];
+    let mut c = upload_f32(&backend, &[2, 2], &c0);
+    backend.gemm(&a, &b, &mut c, 0.0, 1.0).unwrap();
+    let got = f32_values(&backend.download(&c).unwrap());
+    assert_eq!(got, c0);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gemm_k_zero_scales_c_by_beta() {
+    let backend = require_device();
+    let a = upload_f32(&backend, &[2, 0], &[]);
+    let b = upload_f32(&backend, &[0, 3], &[]);
+    let mut c = upload_f32(&backend, &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let before = backend.debug_launches().len();
+    backend.gemm(&a, &b, &mut c, 1.5, 2.0).unwrap();
+    assert_eq!(backend.debug_launches().len(), before + 1);
+    assert_eq!(backend.debug_launches().last().copied(), Some("gemm-f32-cublas"));
+    let got = f32_values(&backend.download(&c).unwrap());
+    assert_eq!(got, vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gemm_m_zero_or_n_zero_is_noop() {
+    let backend = require_device();
+
+    let a = upload_f32(&backend, &[0, 3], &[]);
+    let b = upload_f32(&backend, &[3, 4], &[1.0; 12]);
+    let mut c = upload_f32(&backend, &[0, 4], &[]);
+    let before = backend.debug_launches().len();
+    backend.gemm(&a, &b, &mut c, 1.0, 0.0).unwrap();
+    assert_eq!(backend.debug_launches().len(), before, "M=0 must not record a launch");
+
+    let a = upload_f32(&backend, &[3, 2], &[1.0; 6]);
+    let b = upload_f32(&backend, &[2, 0], &[]);
+    let mut c = upload_f32(&backend, &[3, 0], &[]);
+    let before = backend.debug_launches().len();
+    backend.gemm(&a, &b, &mut c, 1.0, 1.0).unwrap();
+    assert_eq!(backend.debug_launches().len(), before, "N=0 must not record a launch");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn k_zero_beta_zero_is_one_cublas_launch() {
+    let backend = require_device();
+    let a = upload_f32(&backend, &[3, 0], &[]);
+    let b = upload_f32(&backend, &[0, 4], &[]);
+    let mut c = upload_f32(&backend, &[3, 4], &[1.0; 12]);
+    let before = backend.debug_launches().len();
+    backend.gemm(&a, &b, &mut c, 1.0, 0.0).unwrap();
+    assert_eq!(backend.debug_launches().len(), before + 1);
+    assert_eq!(backend.debug_launches().last().copied(), Some("gemm-f32-cublas"));
+    let got = f32_values(&backend.download(&c).unwrap());
+    assert_eq!(got, vec![0.0; 12]);
+}
+
+/// Exercises the missing-library → `UnsupportedDevice` mapping used by [`CudaBackend::new`].
+/// System `libcuda` cannot be reliably hidden via `LD_LIBRARY_PATH`, so this calls the same
+/// catch_unwind arm `new` uses when a dynamic load panics.
+#[cfg(feature = "cuda")]
+#[test]
+fn init_panic_maps_to_unsupported_device() {
+    let mapped: Result<(), Error> =
+        crate::device::map_cuda_init_panic(Err(Box::new("simulated missing CUDA lib")));
+    assert_eq!(mapped, Err(Error::UnsupportedDevice));
+    assert!(crate::device::cuda_libs_present(), "host under test must have CUDA libs present");
 }
