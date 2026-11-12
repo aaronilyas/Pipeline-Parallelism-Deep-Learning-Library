@@ -2,16 +2,22 @@
 //!
 //! f32 gemm is one cuBLAS `sgemm` named `gemm-f32-cublas`. GELU and GELU' are
 //! NVRTC kernels compiled once for `compute_61` in [`CudaBackend::new`].
+//!
+//! gemm, gelu and gelu_backward take no lock and perform no atomic. cudarc's safe layer
+//! does both on these paths (`CudaContext::bind_to_thread` swaps the context's error word,
+//! `PushKernelArg` loads its stream count, and every `sys::*` wrapper reads a `OnceLock`), so
+//! the paths call the driver and cuBLAS entry points resolved once in [`CudaBackend::new`].
 
+use std::ffi::{c_void, CString};
 use std::sync::Arc;
 
 #[cfg(any(test, feature = "debug-counters"))]
 use std::sync::Mutex;
 
-use cudarc::cublas::{result as cublas_result, sys as cublas_sys, CudaBlas};
+use cudarc::cublas::{sys as cublas_sys, CudaBlas};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
-    PushKernelArg,
+    result as driver_result, sys as driver_sys, CudaContext, CudaSlice, CudaStream, DevicePtr,
+    LaunchConfig,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use linalg_core::{row_major_strides, Backend, DType, DeviceKind, Error, Identified, Tensor};
@@ -57,14 +63,44 @@ impl Identified for CudaStore {
     }
 }
 
+/// The GELU module, loaded once, and the raw handles the compute paths launch.
+struct Kernels {
+    driver: &'static driver_sys::Lib,
+    ctx: driver_sys::CUcontext,
+    module: driver_sys::CUmodule,
+    gelu: driver_sys::CUfunction,
+    gelu_backward: driver_sys::CUfunction,
+}
+
+// SAFETY: the handles are written once in `CudaBackend::new` and only read afterwards. The
+// driver API accepts a context, module and function from any thread. Kernels launched through
+// them touch only the tensors passed in, and core's caller obligation says no thread reads or
+// writes a storage_id while another call writes it.
+unsafe impl Send for Kernels {}
+
+// SAFETY: as for `Send`: `&Kernels` exposes only immutable handle values, and concurrent
+// launches are governed by core's caller obligation on storage_ids.
+unsafe impl Sync for Kernels {}
+
+impl Drop for Kernels {
+    fn drop(&mut self) {
+        // SAFETY: `module` was loaded into `ctx`, which `CudaBackend::stream` keeps alive until
+        // after this field is dropped; nothing launches from it once the backend is dropped.
+        unsafe {
+            let _ = (self.driver.cuCtxSetCurrent)(self.ctx);
+            let _ = (self.driver.cuModuleUnload)(self.module);
+        }
+    }
+}
+
 /// CUDA backend. Construct with [`CudaBackend::new`].
 pub struct CudaBackend {
+    /// Declared first, so the module unloads while `stream` still holds the context.
+    kernels: Kernels,
     stream: Arc<CudaStream>,
     blas: CudaBlas,
-    gelu: CudaFunction,
-    gelu_backward: CudaFunction,
-    /// Keeps the NVRTC module alive for the function handles.
-    _module: Arc<CudaModule>,
+    /// cuBLAS entry points, resolved once.
+    cublas: &'static cublas_sys::Lib,
     #[cfg(any(test, feature = "debug-counters"))]
     stats: Mutex<Stats>,
 }
@@ -107,17 +143,35 @@ impl CudaBackend {
             CompileOptions { arch: Some("compute_61"), ..Default::default() },
         )
         .map_err(|_| Error::UnsupportedDevice)?;
-        let module = ctx.load_module(ptx).map_err(|_| Error::UnsupportedDevice)?;
-        let gelu = module.load_function("gelu_kernel").map_err(|_| Error::UnsupportedDevice)?;
-        let gelu_backward =
-            module.load_function("gelu_backward_kernel").map_err(|_| Error::UnsupportedDevice)?;
+        // SAFETY: `new` checked that both libraries load; `culib` loads them once and returns
+        // the process-wide entry-point tables.
+        let (driver, cublas) = unsafe { (driver_sys::culib(), cublas_sys::culib()) };
+        let image = CString::new(ptx.to_src()).map_err(|_| Error::UnsupportedDevice)?;
+        // SAFETY: `CudaContext::new` made `ctx` current on this thread; `image` is a
+        // NUL-terminated PTX image that outlives the call.
+        let module = unsafe { driver_result::module::load_data(image.as_ptr().cast()) }
+            .map_err(|_| Error::UnsupportedDevice)?;
+        let mut kernels = Kernels {
+            driver,
+            ctx: ctx.cu_ctx(),
+            module,
+            gelu: std::ptr::null_mut(),
+            gelu_backward: std::ptr::null_mut(),
+        };
+        let function = |name: &str| {
+            let name = CString::new(name).map_err(|_| Error::UnsupportedDevice)?;
+            // SAFETY: `module` is loaded in the current context.
+            unsafe { driver_result::module::get_function(module, name) }
+                .map_err(|_| Error::UnsupportedDevice)
+        };
+        kernels.gelu = function("gelu_kernel")?;
+        kernels.gelu_backward = function("gelu_backward_kernel")?;
 
         Ok(Self {
+            kernels,
             stream,
             blas,
-            gelu,
-            gelu_backward,
-            _module: module,
+            cublas,
             #[cfg(any(test, feature = "debug-counters"))]
             stats: Mutex::new(Stats { allocs: 0, downloads: 0, uploads: 0, launches: Vec::new() }),
         })
@@ -153,6 +207,57 @@ impl CudaBackend {
         {
             let _ = name;
         }
+    }
+
+    /// Makes the backend's context current on this thread. Worker threads that did not run
+    /// `new` need it before cuBLAS or a launch. Two driver calls; no cudarc wrapper.
+    fn bind(&self) -> Result<(), Error> {
+        let driver = self.kernels.driver;
+        let mut current: driver_sys::CUcontext = std::ptr::null_mut();
+        // SAFETY: `current` is a valid out-pointer; `kernels.ctx` is the live primary context.
+        unsafe {
+            if (driver.cuCtxGetCurrent)(&mut current) != driver_sys::CUresult::CUDA_SUCCESS {
+                return Err(Error::Schedule);
+            }
+            if current != self.kernels.ctx
+                && (driver.cuCtxSetCurrent)(self.kernels.ctx) != driver_sys::CUresult::CUDA_SUCCESS
+            {
+                return Err(Error::Schedule);
+            }
+        }
+        Ok(())
+    }
+
+    /// Launches `function` over `n` elements on the backend's stream with `params`.
+    fn launch(
+        &self,
+        function: driver_sys::CUfunction,
+        n: usize,
+        params: &mut [*mut c_void],
+    ) -> Result<(), Error> {
+        self.bind()?;
+        let cfg = LaunchConfig::for_num_elems(n.max(1) as u32);
+        // SAFETY: `function` belongs to the module loaded in this context, and `params` holds
+        // one pointer per kernel parameter, each to a live value of the parameter's type.
+        let status = unsafe {
+            (self.kernels.driver.cuLaunchKernel)(
+                function,
+                cfg.grid_dim.0,
+                cfg.grid_dim.1,
+                cfg.grid_dim.2,
+                cfg.block_dim.0,
+                cfg.block_dim.1,
+                cfg.block_dim.2,
+                cfg.shared_mem_bytes,
+                self.stream.cu_stream(),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status != driver_sys::CUresult::CUDA_SUCCESS {
+            return Err(Error::Schedule);
+        }
+        Ok(())
     }
 
     fn make_store(&self, slice: CudaSlice<u8>, nbytes: usize) -> Result<CudaStore, Error> {
@@ -338,14 +443,14 @@ impl Backend for CudaBackend {
         }
 
         // Worker threads that did not run `new` must bind the context first.
-        self.stream.context().bind_to_thread().map_err(|_| Error::Schedule)?;
+        self.bind()?;
 
         // SAFETY: pointers are live device allocations for a/b/c; dims/ld match
         // the layouts above; Backend callers do not race writes on these ids.
         // cuBLAS with beta==0 does not read C (NaN-safe). With alpha==0, k_eff
         // is 0 so A and B are not referenced.
-        unsafe {
-            cublas_result::sgemm(
+        let status = unsafe {
+            (self.cublas.cublasSgemm_v2)(
                 *self.blas.handle(),
                 trans_b,
                 trans_a,
@@ -361,8 +466,10 @@ impl Backend for CudaBackend {
                 c.storage.buf.ptr as *mut f32,
                 ldc_i,
             )
+        };
+        if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(Error::Schedule);
         }
-        .map_err(|_| Error::Schedule)?;
 
         self.record("gemm-f32-cublas");
         Ok(())
@@ -373,15 +480,16 @@ impl Backend for CudaBackend {
         if x.storage.storage_id() == y.storage.storage_id() {
             return Err(Error::Alias);
         }
-        let n_i32 = i32::try_from(n).map_err(|_| Error::Shape)?;
-        let mut builder = self.stream.launch_builder(&self.gelu);
-        builder.arg(&y.storage.buf.slice);
-        builder.arg(&x.storage.buf.slice);
-        builder.arg(&n_i32);
-        let cfg = LaunchConfig::for_num_elems(n.max(1) as u32);
-        // SAFETY: kernel writes `y` and reads `x`; lengths are `n` f32 elements;
+        let mut n_i32 = i32::try_from(n).map_err(|_| Error::Shape)?;
+        let (mut y_ptr, mut x_ptr) = (y.storage.buf.ptr, x.storage.buf.ptr);
+        // gelu_kernel(float* y, const float* x, int n): writes `y`, reads `x`, `n` f32 each.
         // Backend callers do not race these storage_ids.
-        unsafe { builder.launch(cfg) }.map_err(|_| Error::Schedule)?;
+        let mut params: [*mut c_void; 3] = [
+            (&mut y_ptr as *mut u64).cast(),
+            (&mut x_ptr as *mut u64).cast(),
+            (&mut n_i32 as *mut i32).cast(),
+        ];
+        self.launch(self.kernels.gelu, n, &mut params)?;
         self.record("gelu-cuda");
         Ok(())
     }
@@ -399,16 +507,18 @@ impl Backend for CudaBackend {
         if pre_id == dy_id || pre_id == dx_id || dy_id == dx_id {
             return Err(Error::Alias);
         }
-        let n_i32 = i32::try_from(n).map_err(|_| Error::Shape)?;
-        let mut builder = self.stream.launch_builder(&self.gelu_backward);
-        builder.arg(&dx.storage.buf.slice);
-        builder.arg(&pre.storage.buf.slice);
-        builder.arg(&dy.storage.buf.slice);
-        builder.arg(&n_i32);
-        let cfg = LaunchConfig::for_num_elems(n.max(1) as u32);
-        // SAFETY: kernel writes `dx` and reads `pre`/`dy`; lengths are `n` f32
-        // elements; Backend callers do not race these storage_ids.
-        unsafe { builder.launch(cfg) }.map_err(|_| Error::Schedule)?;
+        let mut n_i32 = i32::try_from(n).map_err(|_| Error::Shape)?;
+        let (mut dx_ptr, mut pre_ptr, mut dy_ptr) =
+            (dx.storage.buf.ptr, pre.storage.buf.ptr, dy.storage.buf.ptr);
+        // gelu_backward_kernel(float* dx, const float* pre, const float* dy, int n): writes
+        // `dx`, reads `pre` and `dy`, `n` f32 each. Backend callers do not race these ids.
+        let mut params: [*mut c_void; 4] = [
+            (&mut dx_ptr as *mut u64).cast(),
+            (&mut pre_ptr as *mut u64).cast(),
+            (&mut dy_ptr as *mut u64).cast(),
+            (&mut n_i32 as *mut i32).cast(),
+        ];
+        self.launch(self.kernels.gelu_backward, n, &mut params)?;
         self.record("gelu-backward-cuda");
         Ok(())
     }
