@@ -19,3 +19,8 @@ proptest = "=1.12.0"
 rand = "=0.10.3"
 rand_chacha = "=0.10.0"
 rayon = "=1.12.0"
+
+[workspace]
+members = [".", "crates/core"]
+default-members = ["crates/core"]
+resolver = "2"
