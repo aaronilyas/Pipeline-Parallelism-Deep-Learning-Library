@@ -1393,3 +1393,140 @@ fn bench_other_paths() {
         6,
     );
 }
+
+// --- Audit regression tests (CON3) -------------------------------------------------------
+
+fn fill_f32(buf: &metal::BufferRef, len: usize, value: f32) {
+    // SAFETY: the shared buffer holds at least `len` f32s and no GPU work is in flight.
+    unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut f32, len).fill(value) };
+}
+
+fn read_f32s(buf: &metal::BufferRef, len: usize) -> Vec<f32> {
+    // SAFETY: the shared buffer holds at least `len` f32s and the GPU has finished.
+    unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, len).to_vec() }
+}
+
+/// CON3: an f32 result whose exact value is subnormal must meet the spec gate against the
+/// unrounded f64 reference, on the tiled, Split-K, and K = 1 paths. The only allowance beyond
+/// the spec formula is half the smallest subnormal: the rounding error any correctly
+/// rounded f32 output has below the normal range.
+#[test]
+fn audit_f32_subnormal_results_meet_the_spec_gate() {
+    let ctx = context();
+    for (path, m, k, n) in [("tiled", 64usize, 64usize, 64usize), ("split-K", 2, 50_000, 2), ("K=1", 33, 1, 17)] {
+        let (a_buf, b_buf) = (alloc_shared::<f32>(&ctx, m * k), alloc_shared::<f32>(&ctx, k * n));
+        let c_buf = alloc_shared::<f32>(&ctx, m * n);
+        let (a_val, b_val) = (1.0e-20f32, 1.0e-20f32 / k as f32);
+        fill_f32(&a_buf, m * k, a_val);
+        fill_f32(&b_buf, k * n, b_val);
+        fill_f32(&c_buf, m * n, f32::NAN);
+        let a = TensorView::<f32>::row_major(&a_buf, 0, vec![m, k]);
+        let b = TensorView::<f32>::row_major(&b_buf, 0, vec![k, n]);
+        let c = TensorView::<f32>::row_major(&c_buf, 0, vec![m, n]);
+        gemm(&ctx, 1.0, &a, &b, 0.0, &c).unwrap();
+        let exact = k as f64 * f64::from(a_val) * f64::from(b_val);
+        let gate = (k as f64 + 2.0) * U * exact + U * exact + 0.5 * f64::from(f32::from_bits(1));
+        for (i, got) in read_f32s(&c_buf, m * n).into_iter().enumerate() {
+            let err = (f64::from(got) - exact).abs();
+            assert!(err <= gate, "{path}: C[{i}] = {got:e}, f64 reference {exact:e}, err {err:e} > gate {gate:e}");
+        }
+    }
+}
+
+/// CON2/CON3: with K = 0, C = β·C. β = 1 must leave a subnormal C bit-identical, and
+/// β = 0.5 must give the exactly representable subnormal half.
+#[test]
+fn audit_k0_keeps_subnormal_c() {
+    let ctx = context();
+    let sub = f32::from_bits(0x0000_1234);
+    for beta in [1.0f32, 0.5] {
+        let (a_buf, b_buf) = (alloc_shared::<f32>(&ctx, 0), alloc_shared::<f32>(&ctx, 0));
+        let c_buf = alloc_shared::<f32>(&ctx, 16);
+        fill_f32(&c_buf, 16, sub);
+        let a = TensorView::<f32>::row_major(&a_buf, 0, vec![4, 0]);
+        let b = TensorView::<f32>::row_major(&b_buf, 0, vec![0, 4]);
+        let c = TensorView::<f32>::row_major(&c_buf, 0, vec![4, 4]);
+        gemm(&ctx, 1.0, &a, &b, beta, &c).unwrap();
+        let want = (f64::from(beta) * f64::from(sub)) as f32; // exact: 0x1234 or 0x091a
+        for (i, got) in read_f32s(&c_buf, 16).into_iter().enumerate() {
+            assert_eq!(got.to_bits(), want.to_bits(), "β={beta}: C[{i}] = {:#010x}, want {:#010x}", got.to_bits(), want.to_bits());
+        }
+    }
+}
+
+fn fill_f16(buf: &metal::BufferRef, len: usize, value: f16) {
+    // SAFETY: the shared buffer holds at least `len` f16s and no GPU work is in flight.
+    unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut f16, len).fill(value) };
+}
+
+fn read_f16s(buf: &metal::BufferRef, len: usize) -> Vec<f16> {
+    // SAFETY: the shared buffer holds at least `len` f16s and the GPU has finished.
+    unsafe { std::slice::from_raw_parts(buf.contents() as *const f16, len).to_vec() }
+}
+
+/// CON3, f16 variant: a result whose exact value is a subnormal f16 must meet the spec gate
+/// (`u_out = 2⁻¹¹`) against the unrounded f64 reference, on the tiled, Split-K, and K = 1
+/// paths. The only extra allowance is half the smallest f16 subnormal, `2⁻²⁵`. The tiled
+/// and Split-K cases also feed subnormal f16 inputs.
+#[test]
+fn audit_f16_subnormal_results_meet_the_spec_gate() {
+    let ctx = context();
+    let cases = [
+        ("tiled", 64usize, 64usize, 64usize, 0.01f32, 1.5e-5f32),
+        ("split-K", 2, 50_000, 2, 2.0e-4, 1.8e-7),
+        ("K=1", 33, 1, 17, 0.01, 0.001),
+    ];
+    for (path, m, k, n, a_val, b_val) in cases {
+        let (a_val, b_val) = (f16::from_f32(a_val), f16::from_f32(b_val));
+        let (a_buf, b_buf) = (alloc_shared::<f16>(&ctx, m * k), alloc_shared::<f16>(&ctx, k * n));
+        let c_buf = alloc_shared::<f16>(&ctx, m * n);
+        fill_f16(&a_buf, m * k, a_val);
+        fill_f16(&b_buf, k * n, b_val);
+        fill_f16(&c_buf, m * n, f16::NAN);
+        let a = TensorView::<f16>::row_major(&a_buf, 0, vec![m, k]);
+        let b = TensorView::<f16>::row_major(&b_buf, 0, vec![k, n]);
+        let c = TensorView::<f16>::row_major(&c_buf, 0, vec![m, n]);
+        gemm(&ctx, 1.0, &a, &b, 0.0, &c).unwrap();
+        let exact = k as f64 * a_val.to_f64() * b_val.to_f64();
+        assert!(
+            exact > f16::from_bits(1).to_f64() && exact < f16::MIN_POSITIVE.to_f64(),
+            "test bug: {path} reference {exact:e} is not a subnormal f16"
+        );
+        let gate = (k as f64 + 2.0) * U * exact
+            + exact / 2048.0
+            + 0.5 * f16::from_bits(1).to_f64();
+        for (i, got) in read_f16s(&c_buf, m * n).into_iter().enumerate() {
+            let err = (got.to_f64() - exact).abs();
+            assert!(
+                err <= gate,
+                "{path}: C[{i}] = {:e}, f64 reference {exact:e}, err {err:e} > gate {gate:e}",
+                got.to_f64()
+            );
+        }
+    }
+}
+
+/// CON2/CON3, f16 variant: with K = 0, C = β·C. β = 1 must leave a subnormal f16 C
+/// bit-identical, and β = 2 must give the exactly representable subnormal double.
+#[test]
+fn audit_k0_keeps_subnormal_c_f16() {
+    let ctx = context();
+    let sub = f16::from_bits(0x0003);
+    for (beta, want) in [(1.0f32, 0x0003u16), (2.0, 0x0006)] {
+        let (a_buf, b_buf) = (alloc_shared::<f16>(&ctx, 0), alloc_shared::<f16>(&ctx, 0));
+        let c_buf = alloc_shared::<f16>(&ctx, 16);
+        fill_f16(&c_buf, 16, sub);
+        let a = TensorView::<f16>::row_major(&a_buf, 0, vec![4, 0]);
+        let b = TensorView::<f16>::row_major(&b_buf, 0, vec![0, 4]);
+        let c = TensorView::<f16>::row_major(&c_buf, 0, vec![4, 4]);
+        gemm(&ctx, 1.0, &a, &b, beta, &c).unwrap();
+        for (i, got) in read_f16s(&c_buf, 16).into_iter().enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want,
+                "β={beta}: C[{i}] = {:#06x}, want {want:#06x}",
+                got.to_bits()
+            );
+        }
+    }
+}
