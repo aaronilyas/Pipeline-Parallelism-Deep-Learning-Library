@@ -727,11 +727,32 @@ kernel void contract_scale_f32(
     contract_scale_body<float>(C, p, tid);
 }
 
+// f32 scale is already one rounding. Casting `half(β * f32(C))` rounds twice and
+// can miss the f16 gate by one ulp (`β = -0.999`, C = 0x0DDC → 0x8DDA instead of
+// 0x8DDB). `two_prod` keeps the exact product; `dd_to_half` rounds it once.
+// Non-finite inputs, and a product that overflows f32, take the IEEE cast.
 kernel void contract_scale_f16(
     device half* C [[buffer(0)]],
     constant ScaleParams& p [[buffer(1)]],
     uint tid [[thread_position_in_grid]]) {
-    contract_scale_body<half>(C, p, tid);
+    if (tid >= p.count) {
+        return;
+    }
+    uint b, row, col;
+    unpack_mn(tid, p.m, p.n, b, row, col);
+    uint index = p.c_offset + decode(b, p.c_batch) + decode(row, p.c_m) + decode(col, p.c_n);
+    float c = float(C[index]);
+    if (!isfinite(p.beta) || !isfinite(c)) {
+        C[index] = half(p.beta * c);
+        return;
+    }
+    float hi, lo;
+    two_prod(p.beta, c, hi, lo);
+    if (!isfinite(hi) || !isfinite(lo)) {
+        C[index] = half(p.beta * c);
+        return;
+    }
+    C[index] = dd_to_half(hi, lo);
 }
 
 // C = 0. Does not load C, so a NaN already in C cannot survive β = 0.

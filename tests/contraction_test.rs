@@ -442,6 +442,36 @@ fn zero_k<T: Scalar>(ctx: &MetalContext) {
     }
 }
 
+/// Non-dyadic `β` with `K = 0`. `half(β * f32(C))` rounds twice: `β = -0.999` and
+/// f16 `0x0DDC` store `0x8DDA`, one ulp off `0x8DDB`. The scale kernel must round once.
+#[test]
+fn scale_f16_nondyadic_beta() {
+    let ctx = context();
+    let (m, n) = (4usize, 3usize);
+    let mut rng = ChaCha8Rng::seed_from_u64(1800);
+    let a = Tensor::<f16>::random(&ctx, Layout::dense(&[m, 0]), &mut rng);
+    let b = Tensor::<f16>::random(&ctx, Layout::dense(&[0, n]), &mut rng);
+    let mut c = Tensor::<f16>::random(&ctx, Layout::dense(&[m, n]), &mut rng);
+    c.raw_mut()[0] = f16::from_bits(0x0DDC);
+    c.raw_mut()[1] = f16::from_f64(f64::INFINITY);
+    c.raw_mut()[2] = f16::from_f64(f64::NAN);
+    let (a0, b0, c0) = (a.raw().to_vec(), b.raw().to_vec(), c.raw().to_vec());
+    let beta = -0.999f32;
+    let expected = reference(
+        1.0,
+        Operand64 { data: &to_f64s(&a0), layout: &a.layout, labels: "mk" },
+        Operand64 { data: &to_f64s(&b0), layout: &b.layout, labels: "kn" },
+        beta,
+        Operand64 { data: &to_f64s(&c0), layout: &c.layout, labels: "mn" },
+    );
+    assert_eq!(gemm(&ctx, 1.0, &a.view(), &b.view(), beta, &c.view()), Ok(()));
+    assert_eq!(c.raw()[0].to_bits(), 0x8DDB, "β·f16 0x0DDC must round once to 0x8DDB");
+    assert_untouched("nondyadic beta", &a0, a.raw(), &[]);
+    assert_untouched("nondyadic beta", &b0, b.raw(), &[]);
+    assert_untouched("nondyadic beta", &c0, c.raw(), &expected.index);
+    check("nondyadic beta K=0", c.raw(), &expected);
+}
+
 /// `M = 0`, `N = 0`, or an empty batch is a no-op that leaves every buffer untouched.
 fn empty_output<T: Scalar>(ctx: &MetalContext) {
     for (seed, (m, n, k)) in [(0, 5, 3), (5, 0, 3), (0, 0, 0), (0, 4, 0)].into_iter().enumerate() {
