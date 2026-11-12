@@ -1,13 +1,18 @@
 //! Contraction tests.
 //!
-//! Every GPU result is gated componentwise against an inline pure-Rust reference that
-//! accumulates in f64 and rounds once to the output type:
+//! Every GPU result is gated componentwise against an inline pure-Rust reference `C_ref`
+//! that accumulates in f64 and is not rounded to the output type:
 //!
-//! `|C_gpu − C_ref| ≤ (K+2)·u·(|α||A||B| + |β||C₀|) + u_out·|C_ref| + η`
+//! `|C_gpu − C_ref| ≤ (K+2)·u·(|α||A||B| + |β||C₀|) + u_out·|C_ref| + η/2`
 //!
 //! with `u = 2⁻²⁴`, `u_out` the unit roundoff of the output type (`2⁻²⁴` for f32, `2⁻¹¹`
-//! for f16) and `η` its smallest subnormal, which covers outputs that underflow. Each case
-//! also logs `max error / (√K·u)`; run with `--nocapture` to see it.
+//! for f16) and `η` its smallest subnormal. `η/2` is the only allowance beyond the spec
+//! formula: it is the rounding error a correctly rounded output has below the normal
+//! range, where `u_out·|C_ref|` no longer covers half a unit in the last place.
+//!
+//! Each case also logs `|C_gpu − C_ref| / (√K·u)` as `err/(√K·u)`; run with `--nocapture`
+//! to see it. The distance is to the unrounded f64 reference, so an f16 result includes
+//! the rounding from the f32 accumulator down to f16 and the printed value is nonzero.
 //!
 //! The `bench_*` and `sweep_*` tests are `#[ignore]`d: run them under the exclusive GPU
 //! lock with `-- --ignored --nocapture --test-threads=1`.
@@ -20,7 +25,7 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 use half::f16;
-use linalg::abi::{alloc_shared, LinalgError, MetalContext, TensorView};
+use linalg::abi::{alloc_shared, compute_pipeline, LinalgError, MetalContext, TensorView};
 use linalg::ops::contraction::{contract, encode_contract, encode_gemm, gemm, Element};
 use metal::foreign_types::{ForeignType, ForeignTypeRef};
 use metal::objc::runtime::{Object, NO};
@@ -42,8 +47,9 @@ trait Scalar: Element + PartialEq + std::fmt::Debug + Send + Sync {
     const NAME: &'static str;
     /// Unit roundoff of the type.
     const U_OUT: f64;
-    /// Smallest positive subnormal: the absolute error floor of an underflowing output.
-    const TINY: f64;
+    /// Half the smallest positive subnormal: the rounding error of a correctly rounded
+    /// output below the normal range.
+    const HALF_TINY: f64;
     /// Correctly rounded conversion (round to nearest even).
     fn from_f64(x: f64) -> Self;
     fn to_f64(self) -> f64;
@@ -53,7 +59,7 @@ trait Scalar: Element + PartialEq + std::fmt::Debug + Send + Sync {
 impl Scalar for f32 {
     const NAME: &'static str = "f32";
     const U_OUT: f64 = U;
-    const TINY: f64 = 1.401_298_464_324_817e-45;
+    const HALF_TINY: f64 = 7.006_492_321_624_085e-46;
     fn from_f64(x: f64) -> Self {
         x as f32
     }
@@ -68,7 +74,7 @@ impl Scalar for f32 {
 impl Scalar for f16 {
     const NAME: &'static str = "f16";
     const U_OUT: f64 = 1.0 / 2048.0;
-    const TINY: f64 = U;
+    const HALF_TINY: f64 = U / 2.0;
     fn from_f64(x: f64) -> Self {
         f16::from_f64(x)
     }
@@ -269,14 +275,14 @@ fn reference(
 
 /// Error statistics of one checked result.
 struct Stats {
-    /// `max |C_gpu − C_ref| / (√K·u)`.
+    /// Largest accumulation error over `√K·u` (see the module documentation).
     normalized: f64,
     /// Worst `|C_gpu − C_ref| / tolerance`; at most 1 when the gate holds.
     gate: f64,
 }
 
-/// Applies the accuracy gate to every element of C, logs the error statistics, and panics
-/// on the first violation.
+/// Applies the accuracy gate to every element of C against the unrounded f64 reference,
+/// logs the error statistics, and panics on the first violation.
 fn check<T: Scalar>(name: &str, got: &[T], expected: &Expected) -> Stats {
     let k = expected.k as f64;
     let (mut max_err, mut gate, mut max_ulps) = (0.0f64, 0.0f64, 0.0f64);
@@ -291,18 +297,20 @@ fn check<T: Scalar>(name: &str, got: &[T], expected: &Expected) -> Stats {
             );
             continue;
         }
-        let err = (value - rounded).abs();
-        let tol = (k + 2.0) * U * expected.magnitude[i] + T::U_OUT * rounded.abs() + T::TINY;
+        let err = (value - exact).abs();
+        let tol = (k + 2.0) * U * expected.magnitude[i] + T::U_OUT * exact.abs() + T::HALF_TINY;
         assert!(
             err <= tol,
-            "{name} [{}]: element {i} is {value}, expected {rounded} (exact {exact}); \
+            "{name} [{}]: element {i} is {value}, f64 reference {exact} (rounds to {rounded}); \
              error {err:e} exceeds tolerance {tol:e} with K = {k}",
             T::NAME
         );
         max_err = max_err.max(err);
         gate = gate.max(err / tol);
-        max_ulps = max_ulps.max(err / (2.0 * T::U_OUT * rounded.abs()).max(T::TINY));
+        max_ulps = max_ulps.max(err / (2.0 * T::U_OUT * exact.abs()).max(2.0 * T::HALF_TINY));
     }
+    // Distance to the unrounded reference, not to the rounded output. f16 therefore logs
+    // its output rounding instead of a structural zero.
     let normalized = max_err / (k.max(1.0).sqrt() * U);
     println!(
         "[contraction] {name} [{}] K={k}: max_err={max_err:.3e} err/(sqrtK*u)={normalized:.2} \
@@ -1101,35 +1109,45 @@ fn sweep_shapes<T: Scalar>() {
     let extents = [1usize, 2, 7, 8, 9, 31, 32, 33, 63, 64, 65, 70];
     let inner = [0usize, 1, 2, 7, 8, 9, 31, 32, 33, 63, 64, 65, 100, 129];
     let scalars = [(1.0f32, 0.0f32), (-0.75, 1.0), (0.5, -0.5), (2.0, 0.0)];
-    let (mut seed, mut worst) = (0u64, 0.0f64);
+    let (mut seed, mut worst, mut worst_gate) = (0u64, 0.0f64, 0.0f64);
     for m in extents {
         for n in extents {
             for k in inner {
                 let (alpha, beta) = scalars[(seed % 4) as usize];
                 let stats = Case::matmul(m, n, k).scalars(alpha, beta).run::<T>(&ctx, 5000 + seed);
                 worst = worst.max(stats.normalized);
+                worst_gate = worst_gate.max(stats.gate);
                 seed += 1;
             }
         }
     }
-    println!("[sweep] shapes [{}]: {seed} cases, worst err/(sqrtK*u) = {worst:.2}", T::NAME);
+    println!(
+        "[sweep] shapes [{}]: {seed} cases, worst err/(sqrtK*u) = {worst:.2}, \
+         worst gate ratio = {worst_gate:.3}",
+        T::NAME
+    );
 }
 
 /// Sweep of small outputs against long inner extents, the Split-K regime.
 fn sweep_split_k<T: Scalar>() {
     let ctx = context();
-    let (mut seed, mut worst) = (0u64, 0.0f64);
+    let (mut seed, mut worst, mut worst_gate) = (0u64, 0.0f64, 0.0f64);
     for m in [1usize, 3, 8, 17, 33] {
         for n in [1usize, 3, 8, 17, 33] {
             for k in [1_000usize, 4_097, 50_000, 262_145] {
                 let beta = [0.0f32, -0.5][(seed % 2) as usize];
                 let stats = Case::matmul(m, n, k).scalars(1.0, beta).run::<T>(&ctx, 6000 + seed);
-                worst = worst.max(stats.normalized.max(stats.gate));
+                worst = worst.max(stats.normalized);
+                worst_gate = worst_gate.max(stats.gate);
                 seed += 1;
             }
         }
     }
-    println!("[sweep] split-K [{}]: {seed} cases, worst err/(sqrtK*u) = {worst:.2}", T::NAME);
+    println!(
+        "[sweep] split-K [{}]: {seed} cases, worst err/(sqrtK*u) = {worst:.2}, \
+         worst gate ratio = {worst_gate:.3}",
+        T::NAME
+    );
 }
 
 #[test]
@@ -1216,8 +1234,8 @@ fn time_runs(
     (times[0], times[times.len() / 2])
 }
 
-/// Gates `samples` randomly chosen entries of a dense `m × n` product against the f64
-/// reference and returns the worst `error / (√K·u)`.
+/// Gates `samples` randomly chosen entries of a dense `m × n` product against the unrounded
+/// f64 reference and returns the worst `error / (√K·u)`.
 fn spot_check(
     a: &[f32],
     b: &[f32],
@@ -1235,9 +1253,8 @@ fn spot_check(
             sum += product;
             abs += product.abs();
         }
-        let rounded = f64::from(sum as f32);
-        let err = (f64::from(c[i * n + j]) - rounded).abs();
-        let tol = (k as f64 + 2.0) * U * abs + U * rounded.abs();
+        let err = (f64::from(c[i * n + j]) - sum).abs();
+        let tol = (k as f64 + 2.0) * U * abs + U * sum.abs();
         assert!(err <= tol, "bench entry ({i}, {j}): error {err:e} exceeds tolerance {tol:e}");
         worst = worst.max(err / ((k as f64).sqrt() * U));
     }
@@ -1286,6 +1303,55 @@ fn bench_square_f32_vs_mps() {
             gflops(mps.0),
             gflops(mps.1),
             100.0 * mps.0 / ours.0,
+        );
+    }
+}
+
+/// f16 square GEMM at 1024, 2048, and 4096 next to f32 on the same shapes, in GFLOP/s.
+/// There is no spec target; both types run the same `simdgroup_matrix` tiled kernel, so
+/// f16 should stay within a small factor of f32.
+#[test]
+#[ignore = "benchmark: run under the exclusive GPU lock"]
+fn bench_square_f16() {
+    fn run<T: Scalar>(ctx: &MetalContext, n: usize, reps: usize) -> (f64, f64) {
+        let mut rng = ChaCha8Rng::seed_from_u64(n as u64);
+        let a = Tensor::<T>::random(ctx, Layout::dense(&[n, n]), &mut rng);
+        let b = Tensor::<T>::random(ctx, Layout::dense(&[n, n]), &mut rng);
+        let c = Tensor::<T>::new(ctx, Layout::dense(&[n, n]));
+        let (av, bv, cv) = (a.view(), b.view(), c.view());
+        let (best, median) =
+            time_runs(ctx, reps, |cmd| encode_gemm(ctx, cmd, 1.0, &av, &bv, 0.0, &cv).unwrap());
+        // Gate a sample of entries against the f64 reference so the timing is of a right answer.
+        let (a64, b64) = (to_f64s(a.raw()), to_f64s(b.raw()));
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5eed);
+        for _ in 0..256 {
+            let (i, j) = (rng.random_range(0..n), rng.random_range(0..n));
+            let (mut sum, mut abs) = (0.0f64, 0.0f64);
+            for l in 0..n {
+                let product = a64[i * n + l] * b64[l * n + j];
+                sum += product;
+                abs += product.abs();
+            }
+            let err = (c.raw()[i * n + j].to_f64() - sum).abs();
+            let tol = (n as f64 + 2.0) * U * abs + T::U_OUT * sum.abs() + T::HALF_TINY;
+            assert!(err <= tol, "bench entry ({i}, {j}): error {err:e} exceeds tolerance {tol:e}");
+        }
+        let gflops = |seconds: f64| 2.0 * (n as f64).powi(3) / seconds / 1e9;
+        (gflops(best), gflops(median))
+    }
+    let ctx = context();
+    for (n, reps) in [(1024usize, 30usize), (2048, 12), (4096, 6)] {
+        let half = run::<f16>(&ctx, n, reps);
+        let single = run::<f32>(&ctx, n, reps);
+        println!(
+            "[bench] square {n}x{n}x{n}: f16 {:.1} GFLOP/s (median {:.1}), f32 {:.1} GFLOP/s \
+             (median {:.1}), f16/f32 = {:.1}% (median {:.1}%)",
+            half.0,
+            half.1,
+            single.0,
+            single.1,
+            100.0 * half.0 / single.0,
+            100.0 * half.1 / single.1,
         );
     }
 }
@@ -1413,7 +1479,9 @@ fn read_f32s(buf: &metal::BufferRef, len: usize) -> Vec<f32> {
 #[test]
 fn audit_f32_subnormal_results_meet_the_spec_gate() {
     let ctx = context();
-    for (path, m, k, n) in [("tiled", 64usize, 64usize, 64usize), ("split-K", 2, 50_000, 2), ("K=1", 33, 1, 17)] {
+    for (path, m, k, n) in
+        [("tiled", 64usize, 64usize, 64usize), ("split-K", 2, 50_000, 2), ("K=1", 33, 1, 17)]
+    {
         let (a_buf, b_buf) = (alloc_shared::<f32>(&ctx, m * k), alloc_shared::<f32>(&ctx, k * n));
         let c_buf = alloc_shared::<f32>(&ctx, m * n);
         let (a_val, b_val) = (1.0e-20f32, 1.0e-20f32 / k as f32);
@@ -1428,7 +1496,10 @@ fn audit_f32_subnormal_results_meet_the_spec_gate() {
         let gate = (k as f64 + 2.0) * U * exact + U * exact + 0.5 * f64::from(f32::from_bits(1));
         for (i, got) in read_f32s(&c_buf, m * n).into_iter().enumerate() {
             let err = (f64::from(got) - exact).abs();
-            assert!(err <= gate, "{path}: C[{i}] = {got:e}, f64 reference {exact:e}, err {err:e} > gate {gate:e}");
+            assert!(
+                err <= gate,
+                "{path}: C[{i}] = {got:e}, f64 reference {exact:e}, err {err:e} > gate {gate:e}"
+            );
         }
     }
 }
@@ -1449,7 +1520,13 @@ fn audit_k0_keeps_subnormal_c() {
         gemm(&ctx, 1.0, &a, &b, beta, &c).unwrap();
         let want = (f64::from(beta) * f64::from(sub)) as f32; // exact: 0x1234 or 0x091a
         for (i, got) in read_f32s(&c_buf, 16).into_iter().enumerate() {
-            assert_eq!(got.to_bits(), want.to_bits(), "β={beta}: C[{i}] = {:#010x}, want {:#010x}", got.to_bits(), want.to_bits());
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "β={beta}: C[{i}] = {:#010x}, want {:#010x}",
+                got.to_bits(),
+                want.to_bits()
+            );
         }
     }
 }
@@ -1492,9 +1569,7 @@ fn audit_f16_subnormal_results_meet_the_spec_gate() {
             exact > f16::from_bits(1).to_f64() && exact < f16::MIN_POSITIVE.to_f64(),
             "test bug: {path} reference {exact:e} is not a subnormal f16"
         );
-        let gate = (k as f64 + 2.0) * U * exact
-            + exact / 2048.0
-            + 0.5 * f16::from_bits(1).to_f64();
+        let gate = (k as f64 + 2.0) * U * exact + exact / 2048.0 + 0.5 * f16::from_bits(1).to_f64();
         for (i, got) in read_f16s(&c_buf, m * n).into_iter().enumerate() {
             let err = (got.to_f64() - exact).abs();
             assert!(
@@ -1529,4 +1604,327 @@ fn audit_k0_keeps_subnormal_c_f16() {
             );
         }
     }
+}
+
+// --- Subnormal behaviour -----------------------------------------------------------------
+
+/// One contraction on random operands scaled into a chosen magnitude range, gated like
+/// every other case. `scales` multiplies the random A, B, and C₀.
+#[allow(clippy::too_many_arguments)]
+fn run_scaled(
+    ctx: &MetalContext,
+    name: &str,
+    a: (Layout, &str),
+    b: (Layout, &str),
+    c: (Layout, &str),
+    scales: (f64, f64, f64),
+    (alpha, beta): (f32, f32),
+    seed: u64,
+) -> Stats {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut ta = Tensor::<f32>::random(ctx, a.0, &mut rng);
+    let mut tb = Tensor::<f32>::random(ctx, b.0, &mut rng);
+    let mut tc = Tensor::<f32>::random(ctx, c.0, &mut rng);
+    for (tensor, scale) in [(&mut ta, scales.0), (&mut tb, scales.1), (&mut tc, scales.2)] {
+        for x in tensor.raw_mut() {
+            *x = (f64::from(*x) * scale) as f32;
+        }
+    }
+    let (a0, b0, c0) = (ta.raw().to_vec(), tb.raw().to_vec(), tc.raw().to_vec());
+    let expected = reference(
+        alpha,
+        Operand64 { data: &to_f64s(&a0), layout: &ta.layout, labels: a.1 },
+        Operand64 { data: &to_f64s(&b0), layout: &tb.layout, labels: b.1 },
+        beta,
+        Operand64 { data: &to_f64s(&c0), layout: &tc.layout, labels: c.1 },
+    );
+    let (av, bv, cv) = (ta.view(), tb.view(), tc.view());
+    assert_eq!(contract(ctx, alpha, (&av, a.1), (&bv, b.1), beta, (&cv, c.1)), Ok(()), "{name}");
+    assert_untouched(name, &a0, ta.raw(), &[]);
+    assert_untouched(name, &b0, tb.raw(), &[]);
+    assert_untouched(name, &c0, tc.raw(), &expected.index);
+    check(name, tc.raw(), &expected)
+}
+
+/// CON3: operands, products, `β·C`, and results in and around the f32 subnormal range meet
+/// the same gate as everything else, on the tiled, Split-K, K = 1, and general paths.
+#[test]
+fn f32_subnormal_range_meets_the_gate() {
+    let ctx = context();
+    // (A scale, B scale, C₀ scale, α, β)
+    let ranges = [
+        // Every product is subnormal; so is the result.
+        (1e-22, 1e-21, 1.0, 1.0f32, 0.0f32),
+        // The same, added to a subnormal C.
+        (1e-22, 1e-21, 1e-40, -0.75, 1.0),
+        // Normal products and sums, subnormal α·acc and β·C.
+        (1e-10, 1e-10, 1e-39, 3.0e-21, -0.5),
+        // Subnormal A, large B: normal results from subnormal inputs.
+        (1e-41, 1e30, 1e-11, 1.0, 0.7),
+        // Normal products near the bottom of the range, cancelling into subnormal sums.
+        (1e-19, 1e-19, 1e-38, 1.0, -1.0),
+        // Normal everything, result scaled into the subnormal range by β and α.
+        (1.0, 1.0, 1.0, 1.0e-40, 2.5e-41),
+    ];
+    let shapes = [(64usize, 64usize, 64usize), (70, 45, 50), (2, 2, 50_000), (33, 17, 1)];
+    let mut seed = 2100;
+    for (sa, sb, sc, alpha, beta) in ranges {
+        for (m, n, k) in shapes {
+            let name = format!("tiny {m}x{n}x{k} scales=({sa:e},{sb:e},{sc:e}) α={alpha} β={beta}");
+            run_scaled(
+                &ctx,
+                &name,
+                (Layout::dense(&[m, k]), "mk"),
+                (Layout::dense(&[k, n]), "kn"),
+                (Layout::dense(&[m, n]), "mn"),
+                (sa, sb, sc),
+                (alpha, beta),
+                seed,
+            );
+            seed += 1;
+        }
+        let (i, j, k, l, m, n) = (5, 7, 6, 9, 4, 11);
+        run_scaled(
+            &ctx,
+            &format!("tiny general scales=({sa:e},{sb:e},{sc:e}) α={alpha} β={beta}"),
+            (Layout::with(&[i, j, k, l], &[2, 0, 3, 1], &[1, 1, 1, 1], 3), "ijkl"),
+            (Layout::with(&[l, k, m, n], &[3, 0, 2, 1], &[1, 2, 1, 1], 0), "lkmn"),
+            (Layout::with(&[i, m, j, n], &[1, 3, 0, 2], &[1, 1, 2, 1], 8), "imjn"),
+            (sa, sb, sc),
+            (alpha, beta),
+            seed,
+        );
+        seed += 1;
+    }
+}
+
+/// CON3: `C = β·C` (K = 0) is rounded once and never flushed, for subnormal C and for
+/// products that land in the subnormal range, including ties and the smallest subnormal.
+#[test]
+fn scale_f32_is_correctly_rounded_in_the_subnormal_range() {
+    let ctx = context();
+    let values: Vec<f32> = [
+        0x0000_0001u32,
+        0x0000_0003,
+        0x0000_1234,
+        0x007f_ffff,
+        0x0080_0000,
+        0x0080_0001,
+        0x00ff_ffff,
+        0x0123_4567,
+        0x3f80_0000,
+        0x8000_0001,
+        0x8000_1235,
+        0x807f_ffff,
+        0x8080_0003,
+        0x0000_0000,
+        0x8000_0000,
+        0x7f7f_ffff,
+    ]
+    .into_iter()
+    .map(f32::from_bits)
+    .collect();
+    let betas =
+        [0.5f32, -0.5, 0.75, 1.5, -0.999, 3.0, 1.0e-3, 1.0e-30, 1.0e30, 2.0e-45, 1.2e-38, 0.25];
+    for beta in betas {
+        let (a_buf, b_buf) = (alloc_shared::<f32>(&ctx, 0), alloc_shared::<f32>(&ctx, 0));
+        let c_buf = alloc_shared::<f32>(&ctx, values.len());
+        // SAFETY: the shared buffer holds `values.len()` f32s and no GPU work is in flight.
+        unsafe {
+            std::slice::from_raw_parts_mut(c_buf.contents() as *mut f32, values.len())
+                .copy_from_slice(&values);
+        }
+        let a = TensorView::<f32>::row_major(&a_buf, 0, vec![values.len(), 0]);
+        let b = TensorView::<f32>::row_major(&b_buf, 0, vec![0, 1]);
+        let c = TensorView::<f32>::row_major(&c_buf, 0, vec![values.len(), 1]);
+        gemm(&ctx, 1.0, &a, &b, beta, &c).unwrap();
+        for (got, value) in read_f32s(&c_buf, values.len()).into_iter().zip(&values) {
+            let want = (f64::from(beta) * f64::from(*value)) as f32;
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "β={beta:e} · {:#010x}: got {:#010x}, want {:#010x}",
+                value.to_bits(),
+                got.to_bits(),
+                want.to_bits()
+            );
+        }
+    }
+}
+
+/// Test-only kernels that expose the raw float behaviour of the GPU.
+const PROBE_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+/// out[i] = a[i] * b[i] + c[i] as one scalar fused multiply-add.
+kernel void contraction_probe_scalar(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device const float* c [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+    out[i] = fma(a[i], b[i], c[i]);
+}
+
+/// out[i] = c[i] + a[i] * b[i] for i < 8, computed by `simdgroup_multiply_accumulate` on
+/// diagonal 8×8 matrices.
+kernel void contraction_probe_mma(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device const float* c [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float ta[64];
+    threadgroup float tb[64];
+    threadgroup float tc[64];
+    for (uint e = lane; e < 64; e += 32) {
+        uint row = e >> 3;
+        bool diagonal = row == (e & 7);
+        ta[e] = diagonal ? a[row] : 0.0f;
+        tb[e] = diagonal ? b[row] : 0.0f;
+        tc[e] = diagonal ? c[row] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_matrix<float, 8, 8> ma, mb, mc;
+    simdgroup_load(ma, ta, 8);
+    simdgroup_load(mb, tb, 8);
+    simdgroup_load(mc, tc, 8);
+    simdgroup_multiply_accumulate(mc, ma, mb, mc);
+    simdgroup_store(mc, tc, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 8) {
+        out[lane] = tc[lane * 9];
+    }
+}
+"#;
+
+fn probe_options() -> metal::CompileOptions {
+    let options = metal::CompileOptions::new();
+    options.set_fast_math_enabled(false);
+    options.set_language_version(metal::MTLLanguageVersion::V2_4);
+    options
+}
+
+/// Pins the hardware behaviour the contraction kernels are built around: this GPU reads a
+/// subnormal f32 operand as zero and flushes a subnormal f32 result to zero, both in scalar
+/// arithmetic and inside `simdgroup_multiply_accumulate` (which is fused: one rounding per
+/// `acc + a·b`). Normal-range results are IEEE. If this test starts failing because the
+/// GPU honours subnormals, the rescaling pass in the kernels has become unnecessary.
+#[test]
+fn probe_subnormal_flush_is_pinned() {
+    let ctx = context();
+    let p2 = |e: i32| 2f32.powi(e);
+    // (a, b, c, expected c + a·b on this GPU)
+    let cases: [(f32, f32, f32, f32); 8] = [
+        // A subnormal product is flushed (IEEE: 1e-40).
+        (1.0e-20, 1.0e-20, 0.0, 0.0),
+        // A subnormal operand is read as zero (IEEE: about 1e-30).
+        (1.0e-40, 1.0e10, 0.0, 0.0),
+        // A subnormal sum of normal terms is flushed (IEEE: 2^-127).
+        (1.5 * p2(-126), 1.0, -p2(-126), 0.0),
+        // A subnormal accumulator is read as zero (IEEE: 1e-40).
+        (0.0, 0.0, 1.0e-40, 0.0),
+        // Fused: the product is not rounded before the add (unfused gives 0).
+        (1.0 + p2(-12), 1.0 + p2(-12), -(1.0 + p2(-11)), p2(-24)),
+        // Normal range is IEEE.
+        (3.0, 0.1, 1.0, 3.0f32.mul_add(0.1, 1.0)),
+        (1.0e-20, 1.0e-17, 0.0, 1.0e-20f32 * 1.0e-17),
+        (p2(-63), p2(-63), 0.0, p2(-126)),
+    ];
+    let n = cases.len();
+    let buffers: Vec<metal::Buffer> = (0..4).map(|_| alloc_shared::<f32>(&ctx, n)).collect();
+    for (slot, pick) in
+        [(0usize, 0usize), (1, 1), (2, 2)].map(|(slot, field)| (slot, field)).into_iter()
+    {
+        let column: Vec<f32> = cases.iter().map(|c| [c.0, c.1, c.2][pick]).collect();
+        // SAFETY: each shared buffer holds `n` f32s and no GPU work is in flight.
+        unsafe {
+            std::slice::from_raw_parts_mut(buffers[slot].contents() as *mut f32, n)
+                .copy_from_slice(&column);
+        }
+    }
+    for function in ["contraction_probe_scalar", "contraction_probe_mma"] {
+        fill_f32(&buffers[3], n, f32::NAN);
+        let pipeline =
+            compute_pipeline(&ctx, "contraction_probe", PROBE_SOURCE, probe_options, function)
+                .unwrap();
+        let cmd = ctx.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+        for (index, buffer) in buffers.iter().enumerate() {
+            encoder.set_buffer(index as u64, Some(buffer), 0);
+        }
+        if function == "contraction_probe_scalar" {
+            encoder.dispatch_threads(
+                metal::MTLSize::new(n as u64, 1, 1),
+                metal::MTLSize::new(1, 1, 1),
+            );
+        } else {
+            encoder.dispatch_thread_groups(
+                metal::MTLSize::new(1, 1, 1),
+                metal::MTLSize::new(32, 1, 1),
+            );
+        }
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        for (i, (got, case)) in read_f32s(&buffers[3], n).into_iter().zip(&cases).enumerate() {
+            println!(
+                "[probe] {function} case {i}: {:e} + {:e}·{:e} = {got:e} (IEEE {:e})",
+                case.2,
+                case.0,
+                case.1,
+                case.0.mul_add(case.1, case.2)
+            );
+            assert_eq!(
+                got.to_bits(),
+                case.3.to_bits(),
+                "{function} case {i}: {:e} + {:e}·{:e} gave {got:e}, pinned {:e}",
+                case.2,
+                case.0,
+                case.1,
+                case.3
+            );
+        }
+    }
+}
+
+/// Pins the one documented exception to the CON3 gate. Rescaling by powers of two can
+/// lift a product into the normal range only as far as the largest product of the same
+/// contraction allows. Here one contraction holds products of 1e37 and 1e-40: the scale
+/// that keeps 1e37 finite leaves 1e-40 subnormal inside `simdgroup_multiply_accumulate`, so the GPU
+/// flushes it and C[1][1] is 0 where the exact value, 1e-40, is a representable subnormal.
+/// The spec gate has no such exception; this is an open spec question, and this test
+/// records the behaviour so a change in either direction is noticed.
+#[test]
+fn subnormal_product_beyond_rescale_is_flushed() {
+    let ctx = context();
+    let (a_buf, b_buf, c_buf) =
+        (alloc_shared::<f32>(&ctx, 4), alloc_shared::<f32>(&ctx, 4), alloc_shared::<f32>(&ctx, 4));
+    let (a_vals, b_vals) = ([1.0e18f32, 0.0, 0.0, 1.0e-20], [1.0e19f32, 0.0, 0.0, 1.0e-20]);
+    // SAFETY: each shared buffer holds four f32s and no GPU work is in flight.
+    unsafe {
+        std::slice::from_raw_parts_mut(a_buf.contents() as *mut f32, 4).copy_from_slice(&a_vals);
+        std::slice::from_raw_parts_mut(b_buf.contents() as *mut f32, 4).copy_from_slice(&b_vals);
+    }
+    fill_f32(&c_buf, 4, f32::NAN);
+    let a = TensorView::<f32>::row_major(&a_buf, 0, vec![2, 2]);
+    let b = TensorView::<f32>::row_major(&b_buf, 0, vec![2, 2]);
+    let c = TensorView::<f32>::row_major(&c_buf, 0, vec![2, 2]);
+    gemm(&ctx, 1.0, &a, &b, 0.0, &c).unwrap();
+    let got = read_f32s(&c_buf, 4);
+    let exact = [1.0e18f64 as f32 as f64 * f64::from(1.0e19f32), 0.0, 0.0, 1.0e-40];
+    println!("[contraction] beyond-rescale: got {got:?}, f64 reference {exact:?}");
+    for i in 0..3 {
+        let err = (f64::from(got[i]) - exact[i]).abs();
+        assert!(err <= 4.0 * U * exact[i], "C[{i}] = {:e}, reference {:e}", got[i], exact[i]);
+    }
+    assert_eq!(
+        got[3].to_bits(),
+        0,
+        "C[3] = {:e}: the product 1e-20·1e-20 next to 1e18·1e19 is expected to be flushed",
+        got[3]
+    );
 }
