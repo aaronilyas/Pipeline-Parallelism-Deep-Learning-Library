@@ -37,8 +37,9 @@ struct CopyParams {
 
 /// Parameters of the tiled transpose kernels. Mirrors `TileParams` in permutation.rs.
 ///
-/// Axis A is the source's unit-stride axis, axis B the destination's unit-stride axis. All
-/// other axes ("outer") are enumerated by the z coordinate of the threadgroup grid.
+/// Axis A is the source's fastest (smallest non-zero stride) axis, axis B the destination's
+/// unit-stride axis. All other axes ("outer") are enumerated by the z coordinate of the
+/// threadgroup grid.
 struct TileParams {
     /// Source offset in elements.
     uint src_offset;
@@ -48,7 +49,9 @@ struct TileParams {
     uint extent_a;
     /// Extent of axis B.
     uint extent_b;
-    /// Source stride of axis B (axis A has source stride 1).
+    /// Source stride of axis A (the smallest non-zero source stride; 1 for a plain transpose).
+    uint src_stride_a;
+    /// Source stride of axis B.
     uint src_stride_b;
     /// Destination stride of axis A (axis B has destination stride 1).
     uint dst_stride_a;
@@ -95,9 +98,10 @@ kernel void permutation_copy_impl(device const V* src [[buffer(0)]],
     dst[p.dst_offset + i] = v;
 }
 
-/// Tiled transpose of axes A and B for one outer index. A 32x32 tile is read with
-/// coalesced loads along A, staged in threadgroup memory padded to 33 columns (no bank
-/// conflicts on either access direction), then written with coalesced stores along B.
+/// Tiled transpose of axes A and B for one outer index. A 32x32 tile is read with loads
+/// along A at its source stride (coalesced at unit stride, as dense as the source allows
+/// otherwise), staged in threadgroup memory padded to 33 columns (no bank conflicts on
+/// either access direction), then written with coalesced stores along B.
 /// The 32x8 threadgroup moves four tile rows per thread; partial tiles are guarded.
 template <typename V, bool CONJ>
 kernel void permutation_tile_impl(device const V* src [[buffer(0)]],
@@ -125,7 +129,7 @@ kernel void permutation_tile_impl(device const V* src [[buffer(0)]],
     for (uint r = 0; r < TILE; r += TILE_ROWS) {
         uint b = b0 + lane.y + r;
         if (a < p.extent_a && b < p.extent_b) {
-            tile[lane.y + r][lane.x] = src[src_base + a + b * p.src_stride_b];
+            tile[lane.y + r][lane.x] = src[src_base + a * p.src_stride_a + b * p.src_stride_b];
         }
     }
 
