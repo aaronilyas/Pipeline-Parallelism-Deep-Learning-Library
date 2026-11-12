@@ -5,7 +5,6 @@
 
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::ops::Range;
 use std::time::Instant;
 
 use half::f16;
@@ -32,7 +31,7 @@ kernel void bench_copy(device const ulong4* src [[buffer(0)]],
 }
 "#;
 
-fn ctx() -> MetalContext {
+fn metal_context() -> MetalContext {
     MetalContext::new().expect("Metal device")
 }
 
@@ -288,7 +287,7 @@ fn invalid(result: Result<(), LinalgError>) -> bool {
 
 #[test]
 fn slice_keeps_pointer_identity_and_applies_the_offset_formula() {
-    let ctx = ctx();
+    let ctx = metal_context();
     let buf = alloc_shared::<f32>(&ctx, 4096);
     fill_indexed(&buf, 9);
     let parent = TensorView::<f32>::new(&buf, 4, vec![3, 5, 7], vec![40, 8, 2]);
@@ -317,7 +316,7 @@ fn slice_keeps_pointer_identity_and_applies_the_offset_formula() {
 
 #[test]
 fn slice_rejects_out_of_bounds_inverted_and_rank_mismatch() {
-    let ctx = ctx();
+    let ctx = metal_context();
     let buf = alloc_shared::<u16>(&ctx, 256);
     let v = TensorView::<u16>::row_major(&buf, 0, vec![4, 6]);
     let before = buffer_bytes(&buf);
@@ -392,7 +391,7 @@ fn pack_sweep<T: Copy>(ctx: &MetalContext, label: &str) {
 
 #[test]
 fn pack_every_offset_mod_4_covers_head_vector_and_tail() {
-    let ctx = ctx();
+    let ctx = metal_context();
     pack_sweep::<f16>(&ctx, "f16");
     pack_sweep::<f32>(&ctx, "f32");
     pack_sweep::<f64>(&ctx, "f64");
@@ -429,7 +428,7 @@ fn span(offset: usize, shape: &[usize], strides: &[usize]) -> usize {
 
 #[test]
 fn pack_strided_rows_hit_head_vector_and_tail() {
-    let ctx = ctx();
+    let ctx = metal_context();
     // f32: 16-byte alignment is 4 elements. Offset 1..3 forces a scalar head.
     // cols 16 is a multiple of 4 so a row-major destination keeps that alignment on
     // every row; ld 20 is a padded inner-stride-1 source. inner 16 with head 3 is
@@ -489,7 +488,7 @@ fn pack_strided_rows_hit_head_vector_and_tail() {
 
 #[test]
 fn pack_nonunit_inner_stride_broadcast_and_rank_edges() {
-    let ctx = ctx();
+    let ctx = metal_context();
     check_shaped_pack::<f32>(&ctx, "gather", 2, &[32], &[3], 5, &[1]);
     check_shaped_pack::<f16>(&ctx, "gather f16", 1, &[17], &[5], 3, &[1]);
     check_shaped_pack::<[f32; 2]>(&ctx, "gather c32", 0, &[9], &[2], 1, &[1]);
@@ -509,7 +508,7 @@ fn pack_nonunit_inner_stride_broadcast_and_rank_edges() {
     let strides = row_major_strides(&shape);
     check_shaped_pack::<u16>(&ctx, "rank8", 0, &shape, &strides, 0, &strides);
 
-    let c = ctx();
+    let c = metal_context();
     let buf = alloc_shared::<f32>(&c, 64);
     fill_indexed(&buf, 1);
     let dst_buf = alloc_shared::<f32>(&c, 64);
@@ -523,7 +522,7 @@ fn pack_nonunit_inner_stride_broadcast_and_rank_edges() {
 
 #[test]
 fn pack_special_bit_patterns_survive() {
-    let ctx = ctx();
+    let ctx = metal_context();
     fn run<T: Copy>(ctx: &MetalContext, pats: &[Vec<u8>], shape: &[usize], src_strides: &[usize]) {
         let src_buf = alloc_shared::<T>(ctx, span(1, shape, src_strides));
         let dst_buf = alloc_shared::<T>(ctx, span(2, shape, &row_major_strides(shape)));
@@ -652,7 +651,7 @@ fn round_trip<T: Copy>(
 
 #[test]
 fn quadrant_round_trip_127x251_and_empty_blocks() {
-    let ctx = ctx();
+    let ctx = metal_context();
     for ld in [None, Some(252usize)] {
         round_trip::<f32>(&ctx, 127, 251, ld, 3, false);
         round_trip::<f16>(&ctx, 127, 251, ld.map(|_| 256), 3, false);
@@ -668,7 +667,7 @@ fn quadrant_round_trip_127x251_and_empty_blocks() {
 
 #[test]
 fn concat_strided_quadrants_directly() {
-    let ctx = ctx();
+    let ctx = metal_context();
     fn run<T: Copy>(ctx: &MetalContext, m: usize, n: usize, ld: usize) {
         let src_buf = alloc_shared::<T>(ctx, m * ld + 4);
         fill_indexed(&src_buf, 45);
@@ -700,7 +699,7 @@ fn concat_strided_quadrants_directly() {
 
 #[test]
 fn concat_each_axis_of_rank3_including_empty_blocks() {
-    let ctx = ctx();
+    let ctx = metal_context();
     let src_buf = alloc_shared::<f32>(&ctx, 8 * 8 * 8);
     fill_indexed(&src_buf, 70);
     let src = TensorView::<f32>::new(&src_buf, 1, vec![6, 5, 7], vec![40, 8, 1]);
@@ -760,7 +759,7 @@ fn concat_each_axis_of_rank3_including_empty_blocks() {
 
 #[test]
 fn encode_pack_and_concat_share_one_command_buffer() {
-    let ctx = ctx();
+    let ctx = metal_context();
     let src_buf = alloc_shared::<[f32; 2]>(&ctx, 64 * 8);
     fill_indexed(&src_buf, 100);
     let src = TensorView::<[f32; 2]>::new(&src_buf, 3, vec![8, 16], vec![20, 1]);
@@ -787,7 +786,7 @@ fn encode_pack_and_concat_share_one_command_buffer() {
 
 #[test]
 fn pack_and_concat_reject_overlap_bad_shapes_and_sizes_without_writing() {
-    let ctx = ctx();
+    let ctx = metal_context();
     let buf = alloc_shared::<f32>(&ctx, 4096);
     fill_indexed(&buf, 120);
     let before = buffer_bytes(&buf);
@@ -812,14 +811,15 @@ fn pack_and_concat_reject_overlap_bad_shapes_and_sizes_without_writing() {
     assert!(invalid(pack(&ctx, &big, &big_dst)));
     assert!(buffer_bytes(&dst_buf).iter().all(|&b| b == SENTINEL));
 
-    let u8_src = TensorView::<u8>::row_major(&alloc_shared::<u8>(&ctx, 32), 0, vec![16]);
+    let u8_held = alloc_shared::<u8>(&ctx, 32);
+    let u8_src = TensorView::<u8>::row_major(&u8_held, 0, vec![16]);
     let u8_buf = alloc_shared::<u8>(&ctx, 32);
     fill_sentinel(&u8_buf);
     let u8_dst = TensorView::<u8>::row_major(&u8_buf, 0, vec![16]);
     assert!(invalid(pack(&ctx, &u8_src, &u8_dst)));
     assert!(buffer_bytes(&u8_buf).iter().all(|&b| b == SENTINEL));
-    let wide_src =
-        TensorView::<[u64; 4]>::row_major(&alloc_shared::<[u64; 4]>(&ctx, 8), 0, vec![4]);
+    let wide_held = alloc_shared::<[u64; 4]>(&ctx, 8);
+    let wide_src = TensorView::<[u64; 4]>::row_major(&wide_held, 0, vec![4]);
     let wide_buf = alloc_shared::<[u64; 4]>(&ctx, 8);
     fill_sentinel(&wide_buf);
     let wide_dst = TensorView::<[u64; 4]>::row_major(&wide_buf, 0, vec![4]);
@@ -886,7 +886,7 @@ fn best_gbps(
 #[test]
 #[ignore = "benchmark: run under the exclusive GPU lock"]
 fn bench_strided_pack_vs_copy() {
-    let ctx = ctx();
+    let ctx = metal_context();
     let (rows, cols, ld) = (2048usize, 8192usize, 8192usize + 128);
     assert!(ld > cols && ld % 4 == 0 && cols % 8 == 0);
     let bytes = rows * cols * size_of::<f32>();
