@@ -131,7 +131,7 @@ fn with_views(
 }
 
 fn span(shape: &[usize], strides: &[usize], offset: usize) -> usize {
-    if shape.iter().any(|&extent| extent == 0) {
+    if shape.contains(&0) {
         return offset.max(1);
     }
     offset
@@ -509,10 +509,10 @@ fn inplace_matches_out_of_place() {
         std::ptr::copy_nonoverlapping(copy.as_ptr(), src_buf.contents() as *mut u32, copy.len());
     }
     sqrt(&ctx, &src, &src).unwrap();
-    for linear in 0..n {
+    for (linear, &input) in values.iter().enumerate() {
         let inplace = read_at(&src, linear);
         let outplace = read_at(&dst, linear);
-        let expect = reference(values[linear]);
+        let expect = reference(input);
         assert!(
             same_bits(inplace, outplace) && same_bits(inplace, expect),
             "linear {linear}: in-place {:08x} out-of-place {:08x} reference {:08x}",
@@ -565,10 +565,18 @@ fn partial_overlap_is_rejected_and_identical_view_is_inplace() {
     assert!(matches!(err, LinalgError::Overlap(_)), "{err}");
     assert_eq!(snapshot(&buf), before);
 
-    // Same elements, different shape: not the identical view.
+    // Same bytes, different shape: not a sqrt (shapes must match), so this is not Overlap.
     let alt = TensorView::<f32>::new(&buf, 0, vec![4, 8], vec![8, 1]);
     let err = sqrt(&ctx, &src, &alt).unwrap_err();
+    assert!(matches!(err, LinalgError::InvalidArgument(_)), "{err}");
+    assert_eq!(snapshot(&buf), before);
+
+    // Same shape, ranges overlap, strides differ: not the identical in-place view.
+    let packed = TensorView::<f32>::row_major(&buf, 0, vec![8]);
+    let wide = TensorView::<f32>::new(&buf, 0, vec![8], vec![2]);
+    let err = sqrt(&ctx, &packed, &wide).unwrap_err();
     assert!(matches!(err, LinalgError::Overlap(_)), "{err}");
+    assert_eq!(snapshot(&buf), before);
 
     // Adjacent, non-overlapping ranges are legal.
     let left = TensorView::<f32>::row_major(&buf, 0, vec![16]);
