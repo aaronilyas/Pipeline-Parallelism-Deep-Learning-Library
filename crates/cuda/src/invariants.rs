@@ -418,6 +418,44 @@ fn gemm_m_zero_or_n_zero_is_noop() {
     assert_eq!(backend.debug_launches().len(), before, "N=0 must not record a launch");
 }
 
+/// Zero-output gemm whose other extent exceeds `i32::MAX` must be `Error::Shape`.
+/// Storage is a small real alloc; shape/strides describe the huge logical extent.
+#[cfg(feature = "cuda")]
+#[test]
+fn gemm_zero_output_huge_extent_is_shape_error() {
+    let backend = require_device();
+    // > i32::MAX so lda (= k) fails the leading-dimension check after the fix.
+    const HUGE: usize = 3_000_000_000;
+
+    let a_base = backend.alloc(DType::F32, &[1]).unwrap();
+    let b_base = backend.alloc(DType::F32, &[1]).unwrap();
+    let mut c = upload_f32(&backend, &[0, 4], &[]);
+    let c_before = backend.download(&c).unwrap();
+    let launches_before = backend.debug_launches().len();
+
+    // A [0, HUGE], B [HUGE, 4], C [0, 4]. alpha == 0 skips A/B nbytes checks so
+    // the pre-fix early return would incorrectly succeed.
+    let a = Tensor {
+        storage: a_base.storage,
+        dtype: DType::F32,
+        shape: vec![0, HUGE],
+        strides: row_major_strides(&[0, HUGE]),
+        offset: 0,
+    };
+    let b = Tensor {
+        storage: b_base.storage,
+        dtype: DType::F32,
+        shape: vec![HUGE, 4],
+        strides: row_major_strides(&[HUGE, 4]),
+        offset: 0,
+    };
+
+    let result = backend.gemm(&a, &b, &mut c, 0.0, 1.0);
+    assert_eq!(result, Err(Error::Shape));
+    assert_eq!(backend.download(&c).unwrap(), c_before);
+    assert_eq!(backend.debug_launches().len(), launches_before);
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn k_zero_beta_zero_is_one_cublas_launch() {

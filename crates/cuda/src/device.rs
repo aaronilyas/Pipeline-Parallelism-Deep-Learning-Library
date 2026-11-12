@@ -298,11 +298,6 @@ impl Backend for CudaBackend {
             }
         }
 
-        // Empty output: nothing to write and no cuBLAS launch.
-        if m == 0 || n == 0 {
-            return Ok(());
-        }
-
         // alpha == 0 must not reference A or B: pass k = 0 to cuBLAS.
         let k_eff = if alpha == 0.0 { 0 } else { k };
 
@@ -319,12 +314,19 @@ impl Backend for CudaBackend {
         };
         let ldc = n.max(1);
 
+        // Dim/ld i32 checks run before the empty-output early return so a
+        // zero-output gemm whose other extent exceeds i32::MAX is Error::Shape.
         let m_i = i32_dim(m)?;
         let n_i = i32_dim(n)?;
         let k_i = i32_dim(k_eff)?;
         let lda_i = i32_dim(lda)?;
         let ldb_i = i32_dim(ldb)?;
         let ldc_i = i32_dim(ldc)?;
+
+        // Empty output: nothing to write and no cuBLAS launch.
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
 
         // Worker threads that did not run `new` must bind the context first.
         self.stream.context().bind_to_thread().map_err(|_| Error::Schedule)?;
