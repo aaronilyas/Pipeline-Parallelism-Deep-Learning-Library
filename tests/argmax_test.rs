@@ -1108,3 +1108,51 @@ fn bench_complex_and_strided_1e7() {
         );
     }
 }
+
+// --- Audit regression test (ARG3) --------------------------------------------------------
+
+/// ARG3: with Hypot, the picked element's f64 modulus must be within 1 ULP (as f32) of the
+/// f64 maximum, also for near-ties where the f32 formula's rounding decides the order.
+#[test]
+fn audit_hypot_pick_is_within_one_ulp_of_f64_max_on_near_ties() {
+    let ctx = ctx();
+    let mut rng = ChaCha8Rng::seed_from_u64(6);
+    let pairs = 4096usize;
+    let m64 = |z: [f32; 2]| f64::from(z[0]).hypot(f64::from(z[1]));
+    let mut bad = Vec::new();
+    for batch in 0..40 {
+        let scale = [1.0f64, 1e-30, 1e30, 3e38 / 2.0, 1e-38][batch % 5];
+        let mut data = Vec::with_capacity(2 * pairs);
+        for _ in 0..pairs {
+            let rad = scale * rng.random_range(0.5f64..1.0);
+            let t1 = rng.random_range(0.0f64..std::f64::consts::FRAC_PI_2);
+            let t2 = rng.random_range(0.0f64..std::f64::consts::FRAC_PI_2);
+            let k = 1.0 + f64::from(rng.random_range(-3i32..=3)) * 2f64.powi(-24);
+            data.push([(rad * t1.cos()) as f32, (rad * t1.sin()) as f32]);
+            data.push([(rad * k * t2.cos()) as f32, (rad * k * t2.sin()) as f32]);
+        }
+        let xb = upload(&ctx, &data);
+        let outs = alloc_shared::<u32>(&ctx, pairs);
+        let cmd = ctx.queue.new_command_buffer();
+        for i in 0..pairs {
+            let x = TensorView::<[f32; 2]>::new(&xb, 2 * i, vec![2], vec![1]);
+            let out = TensorView::<u32>::row_major(&outs, i, vec![1]);
+            encode_argmax_complex(&ctx, cmd, &x, Magnitude::Hypot, &out).unwrap();
+        }
+        cmd.commit();
+        cmd.wait_until_completed();
+        // SAFETY: `outs` holds `pairs` u32s and the command buffer has completed.
+        let got = unsafe { std::slice::from_raw_parts(outs.contents() as *const u32, pairs) };
+        for i in 0..pairs {
+            let (z, w) = (data[2 * i], data[2 * i + 1]);
+            let want = ref_best([mag32(z, Magnitude::Hypot), mag32(w, Magnitude::Hypot)].into_iter());
+            let tmax = m64(z).max(m64(w)) as f32;
+            let picked = m64([z, w][got[i] as usize]) as f32;
+            let ulps = (i64::from(tmax.to_bits()) - i64::from(picked.to_bits())).unsigned_abs();
+            if ulps > 1 || got[i] as usize != want {
+                bad.push(format!("z={z:?} w={w:?}: got {} (reference {want}), {ulps} ULP below the f64 max", got[i]));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{} near-tie violations, first: {:#?}", bad.len(), &bad[..bad.len().min(5)]);
+}
