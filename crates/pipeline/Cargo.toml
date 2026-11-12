@@ -1,0 +1,15 @@
+[package]
+name = "linalg-pipeline"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+publish = false
+
+[dependencies]
+linalg-core = { path = "../core" }
+linalg-schedule = { path = "../schedule" }
+
+[dev-dependencies]
+linalg-cpu = { path = "../cpu" }
+linalg-transport = { path = "../transport" }

@@ -1,0 +1,10 @@
+[package]
+name = "linalg-transport"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+publish = false
+
+[dependencies]
+linalg-core = { path = "../core" }

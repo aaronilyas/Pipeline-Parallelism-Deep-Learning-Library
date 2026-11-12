@@ -1,0 +1,16 @@
+[package]
+name = "linalg-audit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+publish = false
+
+[dev-dependencies]
+linalg-core = { path = "../core" }
+linalg-cpu = { path = "../cpu" }
+linalg-schedule = { path = "../schedule" }
+linalg-transport = { path = "../transport" }
+linalg-pipeline = { path = "../pipeline" }
+linalg-metal = { path = "../metal", features = ["debug-counters"] }
+linalg-cuda = { path = "../cuda", features = ["debug-counters"] }
