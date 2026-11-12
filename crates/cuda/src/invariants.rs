@@ -482,3 +482,46 @@ fn init_panic_maps_to_unsupported_device() {
     assert_eq!(mapped, Err(Error::UnsupportedDevice));
     assert!(crate::device::cuda_libs_present(), "host under test must have CUDA libs present");
 }
+
+/// gemm, gelu and gelu_backward perform no atomic. cudarc's `CudaContext::bind_to_thread`
+/// (reached directly, or through `LaunchArgs::launch`) starts with `check_err`, an atomic swap of
+/// the context's deferred-error word. A deferred error recorded before a call therefore
+/// survives the call only when that call performed no such swap.
+#[cfg(feature = "cuda")]
+#[test]
+fn compute_paths_leave_the_context_error_atomic_untouched() {
+    use cudarc::driver::{sys::CUresult, DriverError};
+
+    let backend = require_device();
+    let a = upload_f32(&backend, &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let b = upload_f32(&backend, &[3, 2], &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+    let mut c = backend.alloc(DType::F32, &[2, 2]).unwrap();
+    let x = upload_f32(&backend, &[2, 2], &[-1.0, 0.0, 0.5, 2.0]);
+    let g = upload_f32(&backend, &[2, 2], &[1.0, 1.0, 1.0, 1.0]);
+    let mut y = backend.alloc(DType::F32, &[2, 2]).unwrap();
+    let mut dx = backend.alloc(DType::F32, &[2, 2]).unwrap();
+    let ctx = backend.context_for_test();
+    // Nothing is pending before the probe.
+    ctx.check_err().expect("no deferred error before the probe");
+
+    let mut violations = Vec::new();
+    let mut probe = |name: &str, call: &mut dyn FnMut() -> Result<(), Error>| {
+        ctx.record_err::<()>(Err(DriverError(CUresult::CUDA_ERROR_NOT_READY)));
+        let result = call();
+        let pending = ctx.check_err();
+        if result.is_err() || pending.is_ok() {
+            violations.push(format!(
+                "{name}: returned {result:?}; deferred error still pending: {}",
+                pending.is_err()
+            ));
+        }
+    };
+    probe("gemm", &mut || backend.gemm(&a, &b, &mut c, 1.0, 0.0));
+    probe("gelu", &mut || backend.gelu(&x, &mut y));
+    probe("gelu_backward", &mut || backend.gelu_backward(&x, &g, &mut dx));
+    assert!(
+        violations.is_empty(),
+        "a compute path swapped the context error atomic:\n{}",
+        violations.join("\n")
+    );
+}

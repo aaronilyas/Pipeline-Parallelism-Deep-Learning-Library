@@ -168,6 +168,15 @@ impl CudaBackend {
     }
 }
 
+#[cfg(test)]
+impl CudaBackend {
+    /// The context whose deferred-error atomic (`error_state`, read and cleared by cudarc's
+    /// `check_err` inside `bind_to_thread`) the compute paths must leave untouched.
+    pub(crate) fn context_for_test(&self) -> &Arc<CudaContext> {
+        self.stream.context()
+    }
+}
+
 impl Backend for CudaBackend {
     type Store = CudaStore;
 
