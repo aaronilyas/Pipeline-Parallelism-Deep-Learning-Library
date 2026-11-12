@@ -966,3 +966,145 @@ fn bench_strided_pack_vs_copy() {
     }
     assert!(ratio >= 0.80, "strided pack reaches only {:.1}% of copy", 100.0 * ratio);
 }
+
+// --- Audit regression test (SLI1) --------------------------------------------------------
+
+/// SLI1: an empty range is legal even when Σ start·stride lands past the buffer end.
+#[test]
+fn audit_empty_slice_at_extent_end_is_legal() {
+    let ctx = metal_context();
+    let buf = alloc_shared::<f32>(&ctx, 4096); // exactly one 16 KB granule
+    let v = TensorView::<f32>::new(&buf, 0, vec![5, 1], vec![1000, 1]);
+    v.validate().unwrap();
+    let r = slice(&v, &[5..5, 0..1]);
+    assert!(r.is_ok(), "empty in-bounds slice must be legal, got {r:?}");
+    let s = r.unwrap();
+    assert_eq!(s.shape, vec![0, 1]);
+    assert_eq!(s.host_ptr, v.host_ptr);
+    // An empty view addresses nothing, so pack from it must be a no-op, not an error.
+    let dst_buf = alloc_shared::<f32>(&ctx, 1);
+    let dst = TensorView::<f32>::row_major(&dst_buf, 0, vec![0, 1]);
+    pack(&ctx, &s, &dst).unwrap();
+}
+
+// --- Further SLI1 / G6 tests ---------------------------------------------------------------
+
+/// SLI1: an empty slice keeps the exact offset formula while it is within the buffer, is
+/// clamped to the buffer capacity beyond it, and never fails, even when `start · stride`
+/// overflows `usize`.
+#[test]
+fn empty_slice_offset_is_exact_in_range_and_clamped_past_the_buffer() {
+    let ctx = metal_context();
+    let buf = alloc_shared::<f32>(&ctx, 4096);
+    let capacity = 4096;
+    let v = TensorView::<f32>::new(&buf, 3, vec![5, 1], vec![1000, 1]);
+    // 3 + 4*1000 = 4003 is inside the buffer: exact.
+    let inside = slice(&v, &[4..4, 0..1]).unwrap();
+    assert_eq!(inside.offset, 4003);
+    // 3 + 5*1000 = 5003 is past the end: clamped to the capacity.
+    let past = slice(&v, &[5..5, 0..1]).unwrap();
+    assert_eq!(past.offset, capacity);
+    assert!(past.is_empty() && past.validate().is_ok());
+    // Non-empty slices of the same view keep the exact formula.
+    let full = slice(&v, &[2..5, 0..1]).unwrap();
+    assert_eq!(full.offset, 3 + 2 * 1000);
+    // An empty view whose offset arithmetic overflows `usize` still slices to an empty view.
+    let huge = TensorView::<f32>::new(&buf, 0, vec![2, 0], vec![1 << 63, 1]);
+    huge.validate().unwrap();
+    let r = slice(&huge, &[2..2, 0..0]).unwrap();
+    assert!(r.is_empty() && r.validate().is_ok());
+    assert_eq!(r.offset, capacity);
+}
+
+/// SLI1: an empty slice taken past the buffer end is a no-op part of a concatenation.
+#[test]
+fn empty_slice_past_the_buffer_end_is_a_noop_concat_part() {
+    let ctx = metal_context();
+    let buf = alloc_shared::<f32>(&ctx, 4096);
+    fill_indexed(&buf, 5);
+    let v = TensorView::<f32>::new(&buf, 0, vec![5, 1], vec![1000, 1]);
+    let a = slice(&v, &[0..2, 0..1]).unwrap();
+    let gap = slice(&v, &[5..5, 0..1]).unwrap();
+    let b = slice(&v, &[2..5, 0..1]).unwrap();
+    assert!(gap.is_empty());
+    let dst_buf = alloc_shared::<f32>(&ctx, 5);
+    fill_sentinel(&dst_buf);
+    let dst = TensorView::<f32>::row_major(&dst_buf, 0, vec![5, 1]);
+    assert_concat("gap", &ctx, &[&a, &gap, &b], 0, &dst_buf, &dst);
+    // Concatenating only empties writes nothing.
+    let edst_buf = alloc_shared::<f32>(&ctx, 4);
+    fill_sentinel(&edst_buf);
+    let edst = TensorView::<f32>::row_major(&edst_buf, 0, vec![0, 1]);
+    concat(&ctx, &[&gap, &gap], 0, &edst).unwrap();
+    assert!(buffer_bytes(&edst_buf).iter().all(|&b| b == SENTINEL));
+}
+
+/// G6: several `encode_concat` calls with different parameters, axes, and element widths
+/// share one command buffer that is committed once; every result is bitwise correct.
+#[test]
+fn many_encode_concats_with_different_params_share_one_command_buffer() {
+    let ctx = metal_context();
+    let src_buf = alloc_shared::<f32>(&ctx, 4096);
+    fill_random(&src_buf, &mut rng(21));
+    let src = TensorView::<f32>::new(&src_buf, 5, vec![6, 7, 8], vec![70, 9, 1]);
+    let half_buf = alloc_shared::<f16>(&ctx, 1024);
+    fill_random(&half_buf, &mut rng(22));
+    let halves = TensorView::<f16>::new(&half_buf, 3, vec![4, 9], vec![11, 1]);
+
+    struct Job<'a> {
+        axis: usize,
+        parts: Vec<TensorView<'a, f32>>,
+        dst: TensorView<'a, f32>,
+    }
+    let dst_bufs: Vec<metal::Buffer> = (0..9usize)
+        .map(|round| {
+            let buf = alloc_shared::<f32>(&ctx, 6 * 7 * 8 + round);
+            fill_sentinel(&buf);
+            buf
+        })
+        .collect();
+    let mut jobs: Vec<Job<'_>> = Vec::new();
+    for (round, dst_buf) in dst_bufs.iter().enumerate() {
+        let axis = round % 3;
+        let extent = src.shape[axis];
+        let cut_a = 1 + round % (extent - 1);
+        let cut_b = (cut_a + 1 + round / 3).min(extent);
+        let mut lo = vec![0..6, 0..7, 0..8];
+        let mut mid = lo.clone();
+        let mut hi = lo.clone();
+        lo[axis] = 0..cut_a;
+        mid[axis] = cut_a..cut_b;
+        hi[axis] = cut_b..extent;
+        let parts =
+            vec![slice(&src, &lo).unwrap(), slice(&src, &mid).unwrap(), slice(&src, &hi).unwrap()];
+        let dst = TensorView::<f32>::row_major(dst_buf, round, vec![6, 7, 8]);
+        jobs.push(Job { axis, parts, dst });
+    }
+    let half_dst_buf = alloc_shared::<f16>(&ctx, 4 * 9);
+    fill_sentinel(&half_dst_buf);
+    let half_dst = TensorView::<f16>::row_major(&half_dst_buf, 0, vec![4, 9]);
+    let h0 = slice(&halves, &[0..4, 0..4]).unwrap();
+    let h1 = slice(&halves, &[0..4, 4..9]).unwrap();
+
+    let cmd = ctx.queue.new_command_buffer();
+    for job in &jobs {
+        let refs: Vec<_> = job.parts.iter().collect();
+        encode_concat(&ctx, cmd, &refs, job.axis, &job.dst).unwrap();
+    }
+    encode_concat(&ctx, cmd, &[&h0, &h1], 1, &half_dst).unwrap();
+    cmd.commit();
+    cmd.wait_until_completed();
+    assert_eq!(cmd.status(), metal::MTLCommandBufferStatus::Completed);
+
+    for (n, (job, dst_buf)) in jobs.iter().zip(&dst_bufs).enumerate() {
+        let refs: Vec<_> = job.parts.iter().collect();
+        let want = reference_concat(&refs, job.axis, &job.dst.shape);
+        let mut image = vec![SENTINEL; dst_buf.length() as usize];
+        paint(&mut image, &job.dst, &want);
+        assert_bytes_eq(&format!("concat {n}"), &buffer_bytes(dst_buf), &image);
+    }
+    let want = reference_concat(&[&h0, &h1], 1, &half_dst.shape);
+    let mut image = vec![SENTINEL; half_dst_buf.length() as usize];
+    paint(&mut image, &half_dst, &want);
+    assert_bytes_eq("f16 concat", &buffer_bytes(&half_dst_buf), &image);
+}

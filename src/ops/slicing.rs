@@ -64,7 +64,9 @@ struct VecParams {
 /// Parameters of the concat kernels. Mirrors `ConcatParams` in the shader.
 ///
 /// The part id for each coordinate along the concat axis is a device table (buffer 18),
-/// not a field here.
+/// not a field here, because that table grows with the destination extent and can exceed
+/// the `set_bytes` size limit. Empty parts carry zero offset and strides: no coordinate
+/// ever selects them.
 #[repr(C)]
 struct ConcatParams {
     count: u32,
@@ -471,10 +473,17 @@ fn run_sync(
 /// Returns the sub-view of `view` selected by one range per axis.
 ///
 /// `ranges` has one entry per axis (an empty slice for rank 0). The result borrows the same
-/// buffer: `host_ptr` is the buffer base, the offset grows by `Σ start · stride` (added even
-/// when the range is empty), and the strides are unchanged. Empty ranges are legal. Inverted
-/// ranges, out-of-bounds ranges, and the wrong number of ranges return
+/// buffer: `host_ptr` is the buffer base and the strides are unchanged. For a non-empty
+/// result the offset is exactly `view.offset + Σ start · stride`. Inverted ranges,
+/// out-of-bounds ranges, and the wrong number of ranges return
 /// [`crate::abi::LinalgError::InvalidArgument`]. This is O(rank) and does no GPU work.
+///
+/// Every in-bounds empty range is legal, and the result is a no-op input to [`pack`] and
+/// [`concat`]. An empty view addresses nothing, so its offset is unobservable: the offset
+/// is `view.offset + Σ start · stride` when that is within the buffer, and is clamped to the
+/// buffer capacity (in elements) when it is not, or when the sum overflows `usize`. The
+/// clamp keeps the result valid under [`TensorView::validate`], which accepts an empty view
+/// only when its offset does not exceed the capacity.
 pub fn slice<'a, T>(
     view: &TensorView<'a, T>,
     ranges: &[Range<usize>],
@@ -487,7 +496,8 @@ pub fn slice<'a, T>(
             ranges.len()
         )));
     }
-    let mut offset = view.offset;
+    // `None` once the offset arithmetic overflows; that is an error only for a non-empty view.
+    let mut offset = Some(view.offset);
     let mut shape = Vec::with_capacity(view.rank());
     for (axis, range) in ranges.iter().enumerate() {
         if range.start > range.end {
@@ -499,15 +509,17 @@ pub fn slice<'a, T>(
                 view.shape[axis]
             )));
         }
-        let step = range
-            .start
-            .checked_mul(view.strides[axis])
-            .ok_or_else(|| invalid(format!("slice offset overflow on axis {axis}")))?;
-        offset = offset
-            .checked_add(step)
-            .ok_or_else(|| invalid(format!("slice offset overflow on axis {axis}")))?;
+        offset = offset.and_then(|acc| {
+            range.start.checked_mul(view.strides[axis]).and_then(|step| acc.checked_add(step))
+        });
         shape.push(range.end - range.start);
     }
+    let capacity = view.buffer.length() as usize / size_of::<T>();
+    let offset = if shape.contains(&0) {
+        offset.map_or(capacity, |exact| exact.min(capacity))
+    } else {
+        offset.ok_or_else(|| invalid("slice offset overflow"))?
+    };
     let out = TensorView::new(view.buffer, offset, shape, view.strides.clone());
     out.validate()?;
     Ok(out)
@@ -599,8 +611,13 @@ pub fn concat<T>(
 ///
 /// One dispatch covers every logical destination element. Each thread loads its source
 /// part from a device table indexed by the coordinate along `axis`, then copies one element.
-/// At most [`MAX_CONCAT_PARTS`] parts, including empty ones. The destination must not overlap
-/// any part. An empty destination encodes nothing.
+/// At most [`MAX_CONCAT_PARTS`] parts, including empty ones, which contribute nothing. The
+/// destination must not overlap any part. An empty destination encodes nothing.
+///
+/// `ConcatParams` goes through `set_bytes`. The per-call part table lives in a device buffer
+/// that is dropped when this function returns, so `cmd` must retain its resources: use a
+/// command buffer from `new_command_buffer` (not `new_command_buffer_with_unretained_references`).
+/// The caller's part and destination buffers must stay alive until the GPU finishes.
 pub fn encode_concat<T>(
     ctx: &MetalContext,
     cmd: &metal::CommandBufferRef,
@@ -694,7 +711,7 @@ pub fn encode_concat<T>(
         part_offset: [0; MAX_CONCAT_PARTS],
         part_strides: [[0; MAX_RANK]; MAX_CONCAT_PARTS],
     };
-    for (i, part) in parts.iter().enumerate() {
+    for (i, part) in parts.iter().enumerate().filter(|(_, part)| !part.is_empty()) {
         params.part_offset[i] = to_u32(part.offset, "part offset")?;
         params.part_strides[i] = narrow(&part.strides, "part stride")?;
     }
@@ -702,8 +719,8 @@ pub fn encode_concat<T>(
         return Ok(());
     }
 
-    // `(part, prefix)` per coordinate along `axis`. Constant-memory search over the prefix
-    // selected the wrong part on this GPU, so the table is ordinary device memory.
+    // `(part, prefix)` per coordinate along `axis`. Its length is 2 · extent words, which can
+    // exceed the 4 KB `set_bytes` limit, so the table is a device buffer.
     let extent = dst.shape[axis];
     let table_len = extent.checked_mul(2).ok_or_else(|| invalid("concat part table overflows"))?;
     let mut table = Vec::<u32>::new();
@@ -738,14 +755,11 @@ pub fn encode_concat<T>(
         enc.set_buffer(slot as u64, Some(buffer), 0);
     }
     enc.set_buffer(MAX_CONCAT_PARTS as u64, Some(dst.buffer), 0);
-    // `setBytes` kept the previous dispatch's bytes on this GPU, so params are a device buffer.
-    // The command buffer retains both buffers until the GPU finishes.
-    let params_buf = ctx.device.new_buffer_with_data(
-        &params as *const ConcatParams as *const c_void,
+    enc.set_bytes(
+        (MAX_CONCAT_PARTS + 1) as u64,
         size_of::<ConcatParams>() as u64,
-        metal::MTLResourceOptions::StorageModeShared,
+        &params as *const ConcatParams as *const c_void,
     );
-    enc.set_buffer((MAX_CONCAT_PARTS + 1) as u64, Some(&params_buf), 0);
     enc.set_buffer((MAX_CONCAT_PARTS + 2) as u64, Some(&table_buf), 0);
     enc.dispatch_threads(metal::MTLSize::new(count, 1, 1), metal::MTLSize::new(group, 1, 1));
     enc.end_encoding();

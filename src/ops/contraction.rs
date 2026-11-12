@@ -3,7 +3,34 @@
 //! Labels follow einsum rules. Axes are grouped into batch / M / N / K and adjacent axes
 //! are merged when every operand that carries them is contiguous, so the kernel sees at
 //! most four strides per group. `β = 0` does not read C, `α = 0` does not read A or B,
-//! `K = 0` yields `C = βC`, and an empty M, N, or batch launches nothing.
+//! `K = 0` yields `C = βC`, and an empty M, N, or batch launches nothing. When C is only
+//! scaled (`K = 0` or `α = 0`) and `β = 1`, nothing is launched either: C keeps its bits.
+//!
+//! Both element types run through `simdgroup_matrix` kernels with threadgroup tile
+//! staging and accumulate in f32. f16 operands are widened exactly while they are staged,
+//! and the result is rounded to f16 once, at the store.
+//!
+//! # Subnormals
+//!
+//! The Apple GPU treats a subnormal f32 operand as zero and flushes a subnormal f32 result
+//! to zero, in scalar arithmetic and inside `simdgroup_multiply_accumulate`. The kernels
+//! work around that as follows.
+//!
+//! - `β·C` and the epilogue `α·acc + β·C` are never flushed. Whenever an operand, an
+//!   intermediate, or the result is subnormal they are evaluated on significands in
+//!   `[1, 2)` with integer exponents and rounded to nearest even into the subnormal range.
+//! - A subnormal input, or a product `a·b` below the normal range, would be flushed inside
+//!   the accumulation. Before an f32 contraction, a scan records the largest magnitude of
+//!   A and of B and the smallest nonzero magnitude of each. When an operand is subnormal,
+//!   or the smallest possible product is below `2⁻¹⁰³`, the kernels stage A and B scaled
+//!   by exact powers of two, chosen as large as the largest product allows without
+//!   overflow, and the epilogue removes the scale in integer arithmetic. Uniformly small
+//!   data (say every element near `1e-20`) is therefore exact to the usual bound,
+//!   including results that are themselves subnormal.
+//! - What remains: a product is still flushed when it is below roughly `2⁻²⁵⁰·K` times the
+//!   largest product `max|a|·max|b|` of the same contraction. That takes magnitudes
+//!   spanning more than about `2²⁰⁰`; the flushed products then contribute zero. f16 is
+//!   not affected: its products are never below `2⁻⁴⁸`.
 
 // `msg_send!` expands a `cfg` the objc crate owns. This crate does not list that cfg.
 #![allow(unexpected_cfgs)]
@@ -36,7 +63,7 @@ pub type Operand<'v, 'b, T> = (&'v TensorView<'b, T>, &'v str);
 
 const SOURCE: &str = include_str!("../../shaders/contraction.metal");
 
-/// Tile geometry of `contract_tiled_f32`. The shader constants must stay in lockstep.
+/// Tile geometry of the `contraction_tiled_*` kernels. The shader constants must stay in lockstep.
 const TILE_M: u32 = 64;
 const TILE_N: u32 = 64;
 const TILE_K: u32 = 32;
@@ -123,6 +150,9 @@ struct ReduceParams {
     n: u32,
     batch: u32,
     splits: u32,
+    /// Full contracted extent. The reduce kernel removes the same power-of-two scale the
+    /// partials were accumulated with, and that scale depends on K.
+    k: u32,
     alpha: f32,
     beta: f32,
     c_batch: Axes4,
@@ -130,34 +160,63 @@ struct ReduceParams {
     c_n: Axes4,
 }
 
+/// Host mirror of `ScanParams` in the shader. The scan folds one operand into two slots
+/// of the magnitude record (`slot` and `slot + 1`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScanParams {
+    offset: u32,
+    slot: u32,
+    outer_count: u32,
+    mid_count: u32,
+    inner_count: u32,
+    batch: Axes4,
+    mid: Axes4,
+    inner: Axes4,
+}
+
 const _: () = {
     assert!(std::mem::size_of::<TiledParams>() == 84);
     assert!(std::mem::size_of::<Axes4>() == 32);
     assert!(std::mem::size_of::<GeneralParams>() == 36 + 9 * 32);
     assert!(std::mem::size_of::<ScaleParams>() == 24 + 3 * 32);
-    assert!(std::mem::size_of::<ReduceParams>() == 32 + 3 * 32);
+    assert!(std::mem::size_of::<ReduceParams>() == 36 + 3 * 32);
+    assert!(std::mem::size_of::<ScanParams>() == 20 + 3 * 32);
 };
 
+/// Kernel entry points of one element type, one per plan step.
 struct Kernels {
+    tiled: &'static str,
+    partial: &'static str,
+    reduce: &'static str,
     general: &'static str,
     scale: &'static str,
     zero: &'static str,
+    /// Planes of Split-K scratch per split. Partials are one f32 plane; the power-of-two
+    /// scale lives in the magnitude record, not in a second plane.
+    partial_planes: u32,
 }
 
-/// f16 products all go through `contract_general_f16`. The tiled, partial, and
-/// reduce entry points exist only for f32, so they are named at those plans.
 fn kernels<T: Element>() -> Kernels {
     if TypeId::of::<T>() == TypeId::of::<f32>() {
         Kernels {
-            general: "contract_general_f32",
-            scale: "contract_scale_f32",
-            zero: "contract_zero_f32",
+            tiled: "contraction_tiled_f32",
+            partial: "contraction_partial_f32",
+            reduce: "contraction_reduce_f32",
+            general: "contraction_general_f32",
+            scale: "contraction_scale_f32",
+            zero: "contraction_zero_f32",
+            partial_planes: 1,
         }
     } else {
         Kernels {
-            general: "contract_general_f16",
-            scale: "contract_scale_f16",
-            zero: "contract_zero_f16",
+            tiled: "contraction_tiled_f16",
+            partial: "contraction_partial_f16",
+            reduce: "contraction_reduce_f16",
+            general: "contraction_general_f16",
+            scale: "contraction_scale_f16",
+            zero: "contraction_zero_f16",
+            partial_planes: 1,
         }
     }
 }
@@ -669,6 +728,7 @@ enum Plan {
     Split {
         tiled: TiledParams,
         reduce: ReduceParams,
+        /// 32-bit scratch elements: one plane of f32 partials per split.
         partial_elems: u32,
     },
     General(GeneralParams),
@@ -822,16 +882,17 @@ fn plan_merged<T: Element>(
     let reads_inputs = alpha != 0.0 && merged.k_n != 0;
     check_destination_alias(a, b, c, (merged.m_n, merged.n_n, merged.k_n), reads_inputs)?;
     if !reads_inputs {
+        // C = 1·C is the identity: launching nothing keeps every bit, subnormals included.
+        if beta == 1.0 {
+            return Ok(Plan::Empty);
+        }
         return Ok(Plan::Fill(scale_params(c, &merged, beta)?));
     }
     let single = merged.batch.len() == 1
         && merged.m.len() == 1
         && merged.n.len() == 1
         && merged.k.len() == 1;
-    // f16 rounds once from a double-float dot. The tiled f32 accumulator is a
-    // couple of f32 ulps off, enough to cross an f16 midpoint.
-    let half_out = TypeId::of::<T>() == TypeId::of::<half::f16>();
-    if !single || half_out {
+    if !single {
         return Ok(Plan::General(general_params(a, b, c, &merged, alpha, beta)?));
     }
     let mut tiled = tiled_params(a, b, c, &merged, alpha, beta)?;
@@ -840,7 +901,11 @@ fn plan_merged<T: Element>(
         return Ok(Plan::Tiled(tiled));
     }
     let per_plane = mul_u32(mul_u32(merged.batch_n, merged.m_n)?, merged.n_n)?;
-    let partial_elems = match mul_u32(per_plane, splits) {
+    let planes = match mul_u32(splits, kernels::<T>().partial_planes) {
+        Ok(planes) => planes,
+        Err(_) => return Ok(Plan::Tiled(tiled)),
+    };
+    let partial_elems = match mul_u32(per_plane, planes) {
         Ok(elems) => elems,
         Err(_) => return Ok(Plan::Tiled(tiled)),
     };
@@ -857,6 +922,7 @@ fn plan_merged<T: Element>(
         n: merged.n_n,
         batch: merged.batch_n,
         splits,
+        k: merged.k_n,
         alpha,
         beta,
         c_batch: pack(&merged.batch, |ax| stride(ax.c))?,
@@ -917,6 +983,141 @@ fn dispatch_threads(enc: &metal::ComputeCommandEncoderRef, count: u32) {
     enc.dispatch_threads(metal::MTLSize::new(width, 1, 1), metal::MTLSize::new(group, 1, 1));
 }
 
+fn is_f32<T: Element>() -> bool {
+    TypeId::of::<T>() == TypeId::of::<f32>()
+}
+
+/// Elements of the inner group one `contraction_scan_f32` thread reads. Matches the shader.
+const SCAN_CHUNK: u32 = 256;
+
+/// Right-aligned single axis, matching `pack` for a group that collapsed to one stride.
+fn axes_one(extent: u32, stride: u32) -> Axes4 {
+    Axes4 { ext: [1, 1, 1, extent], stride: [0, 0, 0, stride] }
+}
+
+/// One scanned group: its element count and the mixed-radix address of that count.
+struct ScanGroup {
+    count: u32,
+    axes: Axes4,
+}
+
+fn scan_of(
+    slot: u32,
+    offset: u32,
+    batch: ScanGroup,
+    mid: ScanGroup,
+    inner: ScanGroup,
+) -> Result<ScanParams> {
+    Ok(ScanParams {
+        offset,
+        slot,
+        outer_count: mul_u32(batch.count, mid.count)?,
+        mid_count: mid.count,
+        inner_count: inner.count,
+        batch: batch.axes,
+        mid: mid.axes,
+        inner: inner.axes,
+    })
+}
+
+fn group_one(count: u32, stride: u32) -> ScanGroup {
+    ScanGroup { count, axes: axes_one(count, stride) }
+}
+
+fn tiled_scans(p: &TiledParams) -> Result<(ScanParams, ScanParams)> {
+    let a = scan_of(
+        0,
+        p.a_offset,
+        group_one(p.batch, p.a_batch_stride),
+        group_one(p.m, p.a_m_stride),
+        group_one(p.k, p.a_k_stride),
+    )?;
+    let b = scan_of(
+        2,
+        p.b_offset,
+        group_one(p.batch, p.b_batch_stride),
+        group_one(p.k, p.b_k_stride),
+        group_one(p.n, p.b_n_stride),
+    )?;
+    Ok((a, b))
+}
+
+fn general_scans(p: &GeneralParams) -> Result<(ScanParams, ScanParams)> {
+    let a = scan_of(
+        0,
+        p.a_offset,
+        ScanGroup { count: p.batch, axes: p.a_batch },
+        ScanGroup { count: p.m, axes: p.a_m },
+        ScanGroup { count: p.k, axes: p.a_k },
+    )?;
+    let b = scan_of(
+        2,
+        p.b_offset,
+        ScanGroup { count: p.batch, axes: p.b_batch },
+        ScanGroup { count: p.k, axes: p.b_k },
+        ScanGroup { count: p.n, axes: p.b_n },
+    )?;
+    Ok((a, b))
+}
+
+/// Four u32s: `{A max, A min − 1, B max, B min − 1}`, min slots starting at all-ones so a
+/// missing operand stays "every element is zero". Matches `contraction_scan_f32`.
+fn alloc_stats(ctx: &MetalContext) -> metal::Buffer {
+    let buffer = ctx.device.new_buffer(16, metal::MTLResourceOptions::StorageModeShared);
+    // SAFETY: the shared buffer holds four u32s and no GPU work is in flight on it.
+    unsafe {
+        let words = std::slice::from_raw_parts_mut(buffer.contents() as *mut u32, 4);
+        words.copy_from_slice(&[0, 0xffff_ffff, 0, 0xffff_ffff]);
+    }
+    buffer
+}
+
+fn dispatch_scan(
+    enc: &metal::ComputeCommandEncoderRef,
+    buffer: &metal::BufferRef,
+    stats: &metal::BufferRef,
+    params: &ScanParams,
+) {
+    if params.outer_count == 0 || params.inner_count == 0 {
+        return;
+    }
+    enc.set_buffer(0, Some(buffer), 0);
+    enc.set_buffer(1, Some(stats), 0);
+    set_params(enc, 2, params);
+    let chunks = params.inner_count.div_ceil(SCAN_CHUNK);
+    let width = u64::from(chunks);
+    let height = u64::from(params.outer_count);
+    let gx = u64::from(chunks.clamp(1, 32));
+    let gy = 8u64.min(height).max(1);
+    enc.dispatch_threads(metal::MTLSize::new(width, height, 1), metal::MTLSize::new(gx, gy, 1));
+}
+
+/// Records operand magnitudes for an f32 contraction. f16 products are never subnormal in
+/// f32, so that path does not scan. The caller keeps the returned buffer alive until `cmd`
+/// completes.
+fn encode_scans<T: Element>(
+    ctx: &MetalContext,
+    cmd: &metal::CommandBufferRef,
+    a: &TensorView<'_, T>,
+    b: &TensorView<'_, T>,
+    scans: Option<(ScanParams, ScanParams)>,
+) -> Result<Option<metal::Buffer>> {
+    let Some((a_scan, b_scan)) = scans else {
+        return Ok(None);
+    };
+    if !is_f32::<T>() {
+        return Ok(None);
+    }
+    let stats = alloc_stats(ctx);
+    let state = pipeline(ctx, "contraction_scan_f32")?;
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&state);
+    dispatch_scan(enc, a.buffer, &stats, &a_scan);
+    dispatch_scan(enc, b.buffer, &stats, &b_scan);
+    enc.end_encoding();
+    Ok(Some(stats))
+}
+
 fn encode_plan<T: Element>(
     ctx: &MetalContext,
     cmd: &metal::CommandBufferRef,
@@ -940,13 +1141,23 @@ fn encode_plan<T: Element>(
             Ok(())
         }
         Plan::Tiled(params) => {
-            let state = pipeline(ctx, "contract_tiled_f32")?;
+            let stats = encode_scans(
+                ctx,
+                cmd,
+                a,
+                b,
+                is_f32::<T>().then(|| tiled_scans(&params)).transpose()?,
+            )?;
+            let state = pipeline(ctx, kernels.tiled)?;
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&state);
             enc.set_buffer(0, Some(a.buffer), 0);
             enc.set_buffer(1, Some(b.buffer), 0);
             enc.set_buffer(2, Some(c.buffer), 0);
             set_params(enc, 3, &params);
+            if let Some(stats) = &stats {
+                enc.set_buffer(4, Some(stats), 0);
+            }
             let depth = u64::from(params.batch);
             enc.dispatch_thread_groups(
                 metal::MTLSize::new(
@@ -957,17 +1168,30 @@ fn encode_plan<T: Element>(
                 metal::MTLSize::new(u64::from(TILE_THREADS), 1, 1),
             );
             enc.end_encoding();
+            if let Some(stats) = stats {
+                track(cmd, stats);
+            }
             Ok(())
         }
         Plan::Split { tiled, reduce, partial_elems } => {
+            let stats = encode_scans(
+                ctx,
+                cmd,
+                a,
+                b,
+                is_f32::<T>().then(|| tiled_scans(&tiled)).transpose()?,
+            )?;
             let partial = alloc_partial(ctx, partial_elems);
-            let state = pipeline(ctx, "contract_partial_f32")?;
+            let state = pipeline(ctx, kernels.partial)?;
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&state);
             enc.set_buffer(0, Some(a.buffer), 0);
             enc.set_buffer(1, Some(b.buffer), 0);
             enc.set_buffer(2, Some(&partial), 0);
             set_params(enc, 3, &tiled);
+            if let Some(stats) = &stats {
+                enc.set_buffer(4, Some(stats), 0);
+            }
             let depth = u64::from(tiled.batch) * u64::from(tiled.splits);
             enc.dispatch_thread_groups(
                 metal::MTLSize::new(
@@ -979,18 +1203,31 @@ fn encode_plan<T: Element>(
             );
             enc.end_encoding();
 
-            let state = pipeline(ctx, "contract_reduce_f32")?;
+            let state = pipeline(ctx, kernels.reduce)?;
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&state);
             enc.set_buffer(0, Some(&partial), 0);
             enc.set_buffer(1, Some(c.buffer), 0);
             set_params(enc, 2, &reduce);
+            if let Some(stats) = &stats {
+                enc.set_buffer(3, Some(stats), 0);
+            }
             dispatch_threads(enc, reduce.count);
             enc.end_encoding();
             track(cmd, partial);
+            if let Some(stats) = stats {
+                track(cmd, stats);
+            }
             Ok(())
         }
         Plan::General(params) => {
+            let stats = encode_scans(
+                ctx,
+                cmd,
+                a,
+                b,
+                is_f32::<T>().then(|| general_scans(&params)).transpose()?,
+            )?;
             let state = pipeline(ctx, kernels.general)?;
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&state);
@@ -998,6 +1235,9 @@ fn encode_plan<T: Element>(
             enc.set_buffer(1, Some(b.buffer), 0);
             enc.set_buffer(2, Some(c.buffer), 0);
             set_params(enc, 3, &params);
+            if let Some(stats) = &stats {
+                enc.set_buffer(4, Some(stats), 0);
+            }
             enc.dispatch_thread_groups(
                 metal::MTLSize::new(
                     u64::from(params.n.div_ceil(GENERAL_TILE)),
@@ -1007,6 +1247,9 @@ fn encode_plan<T: Element>(
                 metal::MTLSize::new(32, 1, 1),
             );
             enc.end_encoding();
+            if let Some(stats) = stats {
+                track(cmd, stats);
+            }
             Ok(())
         }
     }
@@ -1027,6 +1270,13 @@ fn finish(cmd: &metal::CommandBufferRef) -> Result<()> {
 /// axis, a label in B and C is an N axis, and a label in all three is a batch axis. Every
 /// label appears in two or three operands, once each, with a single extent. `β = 0` does
 /// not read C (a NaN already there does not propagate) and `α = 0` does not read A or B.
+/// When C is only scaled (`α = 0` or an empty contracted extent) and `β = 1`, nothing is
+/// encoded and C keeps its bits.
+///
+/// f16 operands accumulate in f32 and are rounded to f16 once. Subnormal values of C and
+/// subnormal results are computed, not flushed; the one exception is a product more than
+/// about `2²⁰⁰` below the largest product of its tile, which the GPU flushes to zero (see
+/// the [module documentation](self#subnormals)).
 ///
 /// # Errors
 ///
@@ -1049,7 +1299,9 @@ pub fn encode_contract<T: Element>(
 
 /// Synchronous [`encode_contract`]: commits and waits for completion.
 ///
-/// Host reads of the destination are valid after this returns.
+/// Host reads of the destination are valid after this returns. The scalar rules, errors, and
+/// the subnormal behaviour (see the [module documentation](self#subnormals)) are those of
+/// [`encode_contract`].
 pub fn contract<T: Element>(
     ctx: &MetalContext,
     alpha: f32,
@@ -1067,8 +1319,8 @@ pub fn contract<T: Element>(
 ///
 /// Each view has rank `r ≥ 2` and the same rank. The leading `r − 2` axes are the batch,
 /// and the matrices are `A[..., M, K]`, `B[..., K, N]`, `C[..., M, N]`. Strides may describe
-/// a transpose or a strided window; nothing is copied. The scalar rules match
-/// [`encode_contract`].
+/// a transpose or a strided window; nothing is copied. The scalar rules and the subnormal
+/// behaviour (see the [module documentation](self#subnormals)) match [`encode_contract`].
 ///
 /// # Errors
 ///
@@ -1088,6 +1340,10 @@ pub fn encode_gemm<T: Element>(
 }
 
 /// Synchronous [`encode_gemm`]: commits and waits for completion.
+///
+/// Host reads of the destination are valid after this returns. The scalar rules, errors, and
+/// the subnormal behaviour (see the [module documentation](self#subnormals)) are those of
+/// [`encode_gemm`].
 pub fn gemm<T: Element>(
     ctx: &MetalContext,
     alpha: f32,

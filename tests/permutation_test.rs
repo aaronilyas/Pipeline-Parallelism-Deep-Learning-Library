@@ -336,6 +336,62 @@ fn materialize_padded_leading_dimension_and_sliced_views() {
     );
 }
 
+/// Materializes and adjoints a stride-2 column slice of a padded, offset matrix, whose
+/// transpose has no unit-stride source axis, and compares every word with the reference.
+fn check_non_unit_stride_transpose<T: Element>(ctx: &MetalContext, seed: u64) {
+    let (m, n, ld, offset) = (97usize, 131usize, 269usize, 7usize);
+    let src_buf = alloc_shared::<T>(ctx, span(offset, &[m, n], &[ld, 1]));
+    fill_special(&src_buf, &mut rng(seed));
+    let v = TensorView::<T>::new(&src_buf, offset, vec![m, 65], vec![ld, 2]);
+    let t = permute_view(&v, &[1, 0]).unwrap();
+    let ty = std::any::type_name::<T>();
+    let dst_offset = 3;
+    let len = dst_offset + v.len() + 17;
+
+    let dst_buf = sentinel_buffer::<T>(ctx, len);
+    let dst = TensorView::<T>::row_major(&dst_buf, dst_offset, t.shape.clone());
+    materialize(ctx, &t, &dst).unwrap_or_else(|e| panic!("{ty} materialize: {e}"));
+    assert_dst::<T>(&format!("{ty} materialize"), &dst_buf, dst_offset, &gather_words(&t, false));
+
+    let adj_buf = sentinel_buffer::<T>(ctx, len);
+    let adj = TensorView::<T>::row_major(&adj_buf, dst_offset, t.shape.clone());
+    adjoint(ctx, &v, &adj).unwrap_or_else(|e| panic!("{ty} adjoint: {e}"));
+    assert_dst::<T>(&format!("{ty} adjoint"), &adj_buf, dst_offset, &reference_adjoint(&v));
+
+    let back_buf = sentinel_buffer::<T>(ctx, len);
+    let back = TensorView::<T>::row_major(&back_buf, dst_offset, v.shape.clone());
+    adjoint(ctx, &t, &back).unwrap_or_else(|e| panic!("{ty} adjoint of transpose: {e}"));
+    let label = format!("{ty} adjoint of transpose");
+    assert_dst::<T>(&label, &back_buf, dst_offset, &reference_adjoint(&t));
+}
+
+#[test]
+fn materialize_transpose_of_non_unit_stride_views_uses_tiles_correctly() {
+    let ctx = ctx();
+    check_non_unit_stride_transpose::<f32>(&ctx, 550);
+    check_non_unit_stride_transpose::<[f32; 2]>(&ctx, 551);
+}
+
+#[test]
+fn materialize_transposes_whose_fastest_source_axis_is_strided_or_beside_a_broadcast() {
+    let ctx = ctx();
+    // Rank 3, every axis strided: the fastest source axis (stride 3) moves to every position.
+    for (i, perm) in permutations(3).iter().enumerate() {
+        let seed = 560 + i as u64;
+        let strides = Some(vec![41 * 3 * 40, 3 * 40, 3]);
+        check_materialize::<f32>(&ctx, &[4, 37, 33], perm, 5, strides.clone(), 2, seed);
+        check_materialize::<[f32; 2]>(&ctx, &[4, 37, 33], perm, 5, strides, 2, seed);
+    }
+    // A broadcast axis beside a stride-2 axis, in both orders: with [0, 1] the last axis is
+    // the broadcast and the fastest real axis is the other one.
+    for perm in [[0, 1], [1, 0]] {
+        check_materialize::<f32>(&ctx, &[37, 45], &perm, 1, Some(vec![2, 0]), 0, 570);
+        check_materialize::<[f32; 2]>(&ctx, &[37, 45], &perm, 1, Some(vec![2, 0]), 0, 571);
+    }
+    // Only broadcasts: nothing to tile.
+    check_materialize::<f32>(&ctx, &[33, 35], &[1, 0], 4, Some(vec![0, 0]), 0, 572);
+}
+
 #[test]
 fn materialize_broadcast_zero_strides() {
     let ctx = ctx();
@@ -789,4 +845,80 @@ fn bench_transpose_8191x4099_vs_copy() {
         assert_eq!(w[j * m + i], s[i * n + j], "element ({i},{j})");
     }
     assert!(ratio >= 0.70, "transpose reaches only {:.1}% of plain copy", 100.0 * ratio);
+}
+
+/// Transposes a 4096 x 4096 view whose columns have stride 2 (every other column of a
+/// 4096 x 8192 matrix), so no source axis is unit stride. Prints GB/s of moved elements next
+/// to the plain copy kernel and to materializing the same stride-2 view untransposed, which
+/// reads exactly the same source lines through the coalesced copy. The spec sets no target
+/// for this shape; the check is that the transpose keeps up with that untransposed
+/// stride-2 copy, as the unit-stride transpose does with plain copy.
+#[test]
+#[ignore = "benchmark: run under the exclusive GPU lock"]
+fn bench_transpose_stride2_vs_copy() {
+    let ctx = ctx();
+    let (m, n, ld) = (4096usize, 4096usize, 8192usize);
+    let bytes = m * n * size_of::<f32>();
+    let src_buf = alloc_shared::<f32>(&ctx, m * ld);
+    fill_random(&src_buf, &mut rng(3100));
+    let v = TensorView::<f32>::new(&src_buf, 0, vec![m, n], vec![ld, 2]);
+    let t = permute_view(&v, &[1, 0]).unwrap();
+    let dst_buf = sentinel_buffer::<f32>(&ctx, m * n);
+    let dst = TensorView::<f32>::row_major(&dst_buf, 0, vec![n, m]);
+    let strided_buf = sentinel_buffer::<f32>(&ctx, m * n);
+    let strided = TensorView::<f32>::row_major(&strided_buf, 0, vec![m, n]);
+
+    let pso = compute_pipeline(
+        &ctx,
+        "permutation_bench",
+        BENCH_COPY,
+        metal::CompileOptions::new,
+        "bench_copy",
+    )
+    .unwrap();
+    let count = (m * n) as u32;
+    let copy_dst = sentinel_buffer::<f32>(&ctx, m * n);
+    let copy = |cmd: &metal::CommandBufferRef| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pso);
+        enc.set_buffer(0, Some(&src_buf), 0);
+        enc.set_buffer(1, Some(&copy_dst), 0);
+        enc.set_bytes(2, 4, &count as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_threads(
+            metal::MTLSize::new(m as u64 * n as u64, 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    };
+    let strided_copy =
+        |cmd: &metal::CommandBufferRef| encode_materialize(&ctx, cmd, &v, &strided).unwrap();
+    let transpose =
+        |cmd: &metal::CommandBufferRef| encode_materialize(&ctx, cmd, &t, &dst).unwrap();
+
+    let copy_gbps = best_gbps(&ctx, bytes, 10, 5, copy);
+    let strided_gbps = best_gbps(&ctx, bytes, 10, 5, strided_copy);
+    let transpose_gbps = best_gbps(&ctx, bytes, 10, 5, transpose);
+    let ratio = transpose_gbps / strided_gbps;
+    println!("copy                {copy_gbps:8.2} GB/s");
+    println!(
+        "stride-2 copy       {strided_gbps:8.2} GB/s  ({:.1}% of copy)",
+        100.0 * strided_gbps / copy_gbps
+    );
+    println!(
+        "stride-2 transpose  {transpose_gbps:8.2} GB/s  ({:.1}% of copy, {:.1}% of stride-2 copy)",
+        100.0 * transpose_gbps / copy_gbps,
+        100.0 * ratio
+    );
+
+    // Spot-check the result of the last run.
+    let w = words_mut(&dst_buf);
+    let s = words_mut(&src_buf);
+    for &(i, j) in &[(0usize, 0usize), (m - 1, n - 1), (m - 1, 0), (0, n - 1), (2049, 1031)] {
+        assert_eq!(w[j * m + i], s[i * ld + 2 * j], "element ({i},{j})");
+    }
+    assert!(
+        ratio >= 0.70,
+        "stride-2 transpose reaches only {:.1}% of the stride-2 copy",
+        100.0 * ratio
+    );
 }

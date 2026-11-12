@@ -2,9 +2,9 @@
 //
 // Elements move as raw integers — `ushort` (2 bytes), `uint` (4), `ulong` (8), or `ulong2`
 // (16) — so NaN payloads and -0.0 survive. The host binds every buffer at byte offset 0 and
-// passes element offsets, shapes, and strides in the params struct. Pack params use
-// `setBytes`. Concat params and the part table are device buffers: `setBytes` kept the
-// previous dispatch's bytes on this GPU.
+// passes element offsets, shapes, and strides in the params struct via `setBytes`. Concat
+// also reads a part table from a device buffer, because its size grows with the destination
+// extent along the concat axis and can exceed the 4 KB `setBytes` limit.
 //
 // Pack has two kernels. The scalar kernel addresses an arbitrary stride. The vector kernel
 // runs only when the last axis of both views has stride 1 (or the whole view is one contiguous
@@ -83,8 +83,8 @@ struct VecParams {
 
 /// Parameters of the concat kernels. Mirrors `ConcatParams` in slicing.rs.
 ///
-/// The per-coordinate part id lives in the device table at buffer 18, not in this struct.
-/// Indexing that table from constant memory selected the wrong part on this GPU.
+/// The per-coordinate part id lives in the device table at buffer 18, not in this struct,
+/// because the table grows with the destination extent and can exceed the `setBytes` limit.
 struct ConcatParams {
     /// Number of logical destination elements.
     uint count;
@@ -271,11 +271,9 @@ inline device const E* part_buffer(uint part,
 
 /// Concatenation: one thread per destination element, in row-major logical order.
 ///
-/// `p` and `table` are device buffers. `p` is `ConcatParams` as `uint`s: count, rank, axis,
-/// n_parts, dst_offset, dst_shape[8], dst_strides[8], part_offset[16], part_strides[16 * 8]
-/// (part-major). `table` is `(part, base)` pairs indexed by the coordinate along `axis`;
-/// `base` is that part's exclusive prefix. Coordinates stay in scalars. Constant `setBytes`
-/// storage kept the previous dispatch's bytes on this GPU.
+/// `p` is the mirrored `ConcatParams`, bound with `setBytes` at buffer 17. `table` holds
+/// `(part, base)` pairs indexed by the coordinate along `axis`; `base` is that part's
+/// exclusive prefix. Coordinates stay in scalars.
 template <typename E>
 kernel void slicing_concat_impl(device const E* b0 [[buffer(0)]],
                                 device const E* b1 [[buffer(1)]],
@@ -294,57 +292,55 @@ kernel void slicing_concat_impl(device const E* b0 [[buffer(0)]],
                                 device const E* b14 [[buffer(14)]],
                                 device const E* b15 [[buffer(15)]],
                                 device E* dst [[buffer(16)]],
-                                device const uint* p [[buffer(17)]],
+                                constant ConcatParams& p [[buffer(17)]],
                                 device const uint* table [[buffer(18)]],
                                 uint i [[thread_position_in_grid]]) {
-    uint count = p[0];
-    if (i >= count) {
+    if (i >= p.count) {
         return;
     }
-    uint rank = p[1];
-    uint axis = p[2];
+    uint rank = p.rank;
+    uint axis = p.axis;
 
     // Destination uses full coordinates. The source uses the same coordinates except on
     // `axis`, where the part-local index replaces the destination coordinate.
     uint rem = i;
     uint along = 0;
-    uint d = p[4];
+    uint d = p.dst_offset;
     for (uint ax = rank - 1; ax > 0; --ax) {
-        uint ext = p[5 + ax];
+        uint ext = p.dst_shape[ax];
         uint q = rem / ext;
         uint c = rem - q * ext;
         if (ax == axis) {
             along = c;
         }
-        d += c * p[13 + ax];
+        d += c * p.dst_strides[ax];
         rem = q;
     }
     if (axis == 0) {
         along = rem;
     }
-    d += rem * p[13];
+    d += rem * p.dst_strides[0];
 
     ulong slot = (ulong)along * 2ul;
     uint part = table[slot];
     uint local = along - table[slot + 1ul];
 
     rem = i;
-    uint s = p[21 + part];
-    uint sb = 37 + part * MAX_RANK;
+    uint s = p.part_offset[part];
     for (uint ax = rank - 1; ax > 0; --ax) {
-        uint ext = p[5 + ax];
+        uint ext = p.dst_shape[ax];
         uint q = rem / ext;
         uint c = rem - q * ext;
         if (ax == axis) {
             c = local;
         }
-        s += c * p[sb + ax];
+        s += c * p.part_strides[part][ax];
         rem = q;
     }
     if (axis == 0) {
         rem = local;
     }
-    s += rem * p[sb];
+    s += rem * p.part_strides[part][0];
 
     device const E* src = part_buffer(part, b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12,
                                       b13, b14, b15);
@@ -384,7 +380,7 @@ slicing_concat_impl<ushort>(device const ushort*, device const ushort*, device c
                             device const ushort*, device const ushort*, device const ushort*,
                             device const ushort*, device const ushort*, device const ushort*,
                             device const ushort*, device const ushort*, device const ushort*,
-                            device const ushort*, device ushort*, device const uint*, device const uint*, uint);
+                            device const ushort*, device ushort*, constant ConcatParams&, device const uint*, uint);
 /// Concatenation of 4-byte elements. Sixteen part buffers, then the destination.
 template [[host_name("slicing_concat_e4")]] kernel void
 slicing_concat_impl<uint>(device const uint*, device const uint*, device const uint*,
@@ -392,7 +388,7 @@ slicing_concat_impl<uint>(device const uint*, device const uint*, device const u
                           device const uint*, device const uint*, device const uint*,
                           device const uint*, device const uint*, device const uint*,
                           device const uint*, device const uint*, device const uint*,
-                          device const uint*, device uint*, device const uint*, device const uint*, uint);
+                          device const uint*, device uint*, constant ConcatParams&, device const uint*, uint);
 /// Concatenation of 8-byte elements. Sixteen part buffers, then the destination.
 template [[host_name("slicing_concat_e8")]] kernel void
 slicing_concat_impl<ulong>(device const ulong*, device const ulong*, device const ulong*,
@@ -400,7 +396,7 @@ slicing_concat_impl<ulong>(device const ulong*, device const ulong*, device cons
                            device const ulong*, device const ulong*, device const ulong*,
                            device const ulong*, device const ulong*, device const ulong*,
                            device const ulong*, device const ulong*, device const ulong*,
-                           device const ulong*, device ulong*, device const uint*, device const uint*, uint);
+                           device const ulong*, device ulong*, constant ConcatParams&, device const uint*, uint);
 /// Concatenation of 16-byte elements. Sixteen part buffers, then the destination.
 template [[host_name("slicing_concat_e16")]] kernel void
 slicing_concat_impl<ulong2>(device const ulong2*, device const ulong2*, device const ulong2*,
@@ -408,4 +404,4 @@ slicing_concat_impl<ulong2>(device const ulong2*, device const ulong2*, device c
                             device const ulong2*, device const ulong2*, device const ulong2*,
                             device const ulong2*, device const ulong2*, device const ulong2*,
                             device const ulong2*, device const ulong2*, device const ulong2*,
-                            device const ulong2*, device ulong2*, device const uint*, device const uint*, uint);
+                            device const ulong2*, device ulong2*, constant ConcatParams&, device const uint*, uint);

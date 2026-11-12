@@ -6,7 +6,9 @@
 //   3. equal magnitudes (-0 vs +0, equal infinities, +x vs -x) go to the lowest index.
 // Magnitudes are compared as integer keys (the IEEE bit pattern of a non-negative float orders
 // like its value, and every NaN maps to one key above +inf). Complex |re| and |im| are reduced
-// to that key with integer scaling, so a subnormal part is not flushed before the f32 formula.
+// to that key in integer arithmetic, so the GPU's flush-to-zero handling of subnormals cannot
+// change a bit: the L1 key is the correctly rounded f32 sum and the Hypot key is the correctly
+// rounded f32 modulus (error at most 0.5 ULP, see hypot_key).
 // The order is total on (key, index) pairs and indices are unique, so the
 // winner does not depend on the order in which candidates are combined: results are bitwise
 // deterministic and no atomics are needed.
@@ -24,8 +26,8 @@ constant constexpr uint kThreadgroupSize = 256;
 constant constexpr uint kMaxSimdGroups = 32;
 // Key shared by every NaN: above the key of +inf (0x7f800000).
 constant constexpr uint kNanKey = 0x7fc00000u;
-// Launch parameters; mirrors `Params` in src/ops/argmax.rs field for field.
-struct Params {
+// Launch parameters; mirrors `ArgmaxParams` in src/ops/argmax.rs field for field.
+struct ArgmaxParams {
     ulong offset;      // element offset of the first input element
     ulong stride;      // element stride between consecutive input elements
     ulong out_offset;  // element offset of the u32 output slot
@@ -103,38 +105,6 @@ inline uint round_scaled_int(ulong prod, int binary_exp) {
     return uint(main);
 }
 
-// `s * m * 2^pow2`, with `s` a finite positive normal and `m` a 24-bit integer.
-inline uint scale_f32_u24(float s, uint m, int pow2) {
-    const uint bits = as_type<uint>(s);
-    const uint exp = bits >> 23;
-    const ulong sig = ulong(0x800000u | (bits & 0x7fffffu));
-    return round_scaled_int(sig * ulong(m), int(exp) - 150 + pow2);
-}
-
-// Subtract `delta` from the biased exponent of a positive normal. The callers that use
-// this only do so when the result stays normal, so the significand does not round again.
-inline uint exp_delta(float v, int delta) {
-    const uint bits = as_type<uint>(v);
-    const int exp = int(bits >> 23) + delta;
-    if (exp >= 255) return 0x7f800000u;
-    if (exp >= 1) return (uint(exp) << 23) | (bits & 0x7fffffu);
-    const uint sig = 0x800000u | (bits & 0x7fffffu);
-    return round_scaled_int(ulong(sig), int(bits >> 23) - 150 + delta);
-}
-
-// `m * 2^-126` for a subnormal field `m` in 1 .. 2^23-1. That is the subnormal times 2^23,
-// and it is a normal, built without a floating multiply.
-inline float subnormal_times_2_to_23(uint m) {
-    const uint p = 31u - clz(m);
-    const uint sig = m << (23u - p);
-    return as_type<float>(((p + 1u) << 23) | (sig & 0x7fffffu));
-}
-
-inline float scale_normal(uint bits, int delta) {
-    const int exp = int(bits >> 23) + delta;
-    return as_type<float>((uint(exp) << 23) | (bits & 0x7fffffu));
-}
-
 // |re| + |im| in f32. Subnormal parts are summed in integer units of 2^-149, which is
 // exact: two subnormal fields add to the IEEE bits of their sum (a subnormal, or the
 // normal just above the smallest normal). A subnormal added to a normal uses those same
@@ -156,37 +126,133 @@ inline uint l1_key(uint a, uint b) {
     return round_scaled_int((sig << (exp - 1u)) + ulong(b), -149);
 }
 
-// max·sqrt(1+(min/max)^2) in f32. A subnormal input is scaled into the normal range by
-// an exact power of two, the f32 formula runs there, and the power is removed by an
-// integer exponent adjustment so the rounding matches IEEE and not flush-to-zero.
+// Largest exponent gap at which the smaller part can still move the rounded modulus.
+// With a gap of 13 or more, lo/hi < 2^-12, so hypot - hi < hi * 2^-25, which is strictly
+// below half an ulp of `hi`: the correctly rounded modulus is `hi` itself.
+constant constexpr uint kHypotMaxExpGap = 12;
+// Correction steps allowed after a float estimate. Each estimate is within 3 ulp of the
+// exact value (three rounded operations, a relative 2^-23), so at most 3 steps are taken.
+constant constexpr uint kHypotMaxSteps = 6;
+
+// Correctly rounded sqrt(a^2 + b^2) for two subnormal fields `a`, `b` (not both zero), in
+// units of 2^-149. The modulus is below 2^23.5 units, where f32 values are the integers, so
+// the key is sqrt(a^2 + b^2) rounded to the nearest integer; an integer's square root is
+// never half way between two integers, so there are no ties. A result of 2^23 or more is the
+// bit pattern of that normal value. The float sqrt only seeds the search (its operand is at
+// least 1, so nothing is flushed); the integer tests decide.
+inline uint hypot_key_subnormal(uint a, uint b) {
+    const ulong sum = ulong(a) * ulong(a) + ulong(b) * ulong(b);
+    ulong q = ulong(precise::sqrt(float(sum)));
+    for (uint step = 0; step < kHypotMaxSteps; ++step) {
+        // q is the nearest integer exactly when q^2 - q < sum <= q^2 + q.
+        if (sum > q * q + q) {
+            q += 1ul;
+        } else if (sum <= q * q - q) {
+            q -= 1ul;
+        } else {
+            break;
+        }
+    }
+    return uint(q);
+}
+
+// Exact rounding of sqrt(A^2 + (B * 2^-gap)^2) starting from the candidate `est` (float bits
+// in [1, 4), in units where A * 2^-23 is the larger part). Returns the correctly rounded
+// candidate bits (round to nearest, ties to even).
+//
+// In units where X = A * 2^(gap+1) and Y = 2B are integers, a candidate with significand q
+// and ulp u = 2^s stands for Q = q * u. The residual R = X^2 + Y^2 - Q^2 is far below 2^63
+// in magnitude, so 64-bit wrapping arithmetic yields it exactly. The exact modulus exceeds
+// the midpoint above Q exactly when 4R - 4Qu - u^2 > 0, and is below the midpoint under Q
+// when 4R + 4Qv - v^2 < 0, where v is the ulp under Q (u/2 at a power of two). A zero means
+// an exact tie, which goes to the even significand. The candidate steps one ulp at a time
+// until neither test fires.
+inline uint hypot_round_exact(uint est, uint sig_a, uint sig_b, uint gap) {
+    const ulong x = ulong(sig_a) << (gap + 1u);
+    const ulong y = ulong(sig_b) << 1u;
+    const ulong sum = x * x + y * y;
+    for (uint step = 0; step < kHypotMaxSteps; ++step) {
+        const uint q = 0x800000u | (est & 0x7fffffu);
+        const uint s = (est >> 23) - 126u + gap;
+        const ulong big = ulong(q) << s;
+        const long r4 = long((sum - big * big) << 2u);
+        const bool odd = (q & 1u) != 0u;
+        const long above = r4 - long(big << (s + 2u)) - long(1ul << (2u * s));
+        const uint s_below = q == 0x800000u ? s - 1u : s;
+        const long below = r4 + long(big << (s_below + 2u)) - long(1ul << (2u * s_below));
+        if (above > 0 || (above == 0 && odd)) {
+            est += 1u;
+        } else if (below < 0 || (below == 0 && odd)) {
+            est -= 1u;
+        } else {
+            break;
+        }
+    }
+    return est;
+}
+
+// Key of the complex modulus sqrt(re^2 + im^2), correctly rounded to f32 (round to nearest,
+// ties to even): the error is at most 0.5 ULP for every finite input, the result is +inf
+// only when the rounded modulus exceeds FLT_MAX, and no intermediate overflows or underflows.
+// `a` and `b` are the sign-stripped bits of the two parts.
+//
+// Method, for hi >= lo > 0 with significands A, B (24-bit integers) and exponent gap d:
+//   1. Estimate. fa = A * 2^-23 in [1, 2) and fb = B * 2^(-23-d) in (0, 2) are exact normal
+//      floats, and est = sqrt(fa^2 + fb^2) lies in [1, 2.83], within 3 ulp of the exact
+//      value whether or not the multiply-add is contracted. All operands and results are
+//      normal, so the GPU's flush-to-zero mode is never reached. The estimate only seeds
+//      the integer tests below; the key does not depend on how it was rounded.
+//   2. 32-bit certificate. With q the significand of est, e its exponent (0 or 1) and
+//      u = 2^(e-23) its ulp, the residual fa^2 + fb^2 - est^2 in units of 2^-46 is
+//      r + f with r = A^2 + floor(B^2 / 4^d) - q^2 * 4^e and 0 <= f < 1. It is below 2^29 in
+//      magnitude, so wrapping 32-bit arithmetic yields r exactly. In the same units
+//      w = q * 4^e is est * u, and the exact value lies above the midpoint over est exactly
+//      when r + f > w + 4^e/4, and below the midpoint under est when r + f < -w + 4^e/4
+//      (for one common ulp). Hence est is correctly rounded if 2 - w <= r < w, est + u if
+//      w + 2 <= r < 3w, and est - u if 10 - 3w <= r < -w; the bounds are tightened where
+//      the ulp halves under a power of two. These ranges exclude every exact tie.
+//   3. Anything else (a value within about 2^-23 ulp of a midpoint, or an estimate more than
+//      one step off) goes to hypot_round_exact.
+//   4. The exponent of `hi` is added back as an integer; the significand is not rounded
+//      again, and a carry past the largest finite exponent gives +inf.
 inline uint hypot_key(uint a, uint b) {
-    if (a > 0x7f800000u || b > 0x7f800000u) return kNanKey;
-    if (a == 0x7f800000u || b == 0x7f800000u) return 0x7f800000u;
-    if (a < b) {
-        const uint swap = a;
-        a = b;
-        b = swap;
+    const uint hi = max(a, b);
+    const uint lo = min(a, b);
+    a = hi;
+    b = lo;
+    if (a >= 0x7f800000u) return a > 0x7f800000u ? kNanKey : a;
+    const uint exp_a = a >> 23;
+    const uint gap = exp_a - max(b >> 23, 1u);
+    if (b == 0u || gap > kHypotMaxExpGap) {
+        return (a < 0x00800000u && b != 0u) ? hypot_key_subnormal(a, b) : a;
     }
-    if (b == 0u) return a;
-    if (a >= 0x00800000u && b >= 0x00800000u) {
-        const float hi = as_type<float>(a);
-        const float lo = as_type<float>(b);
-        const float r = precise::divide(lo, hi);
-        return key_of(hi * precise::sqrt(fma(r, r, 1.0f)));
+    const uint sig_a = 0x800000u | (a & 0x7fffffu);
+    const uint sig_b = b >= 0x00800000u ? (0x800000u | (b & 0x7fffffu)) : b;
+
+    const float fa = as_type<float>(0x3f800000u | (a & 0x7fffffu));
+    const float fb = float(sig_b) * as_type<float>((104u - gap) << 23);
+    // The clamp keeps the integer steps well defined whatever the float unit returns.
+    uint est = clamp(as_type<uint>(precise::sqrt(fa * fa + fb * fb)), 0x3f800000u, 0x407fffffu);
+
+    const uint q = 0x800000u | (est & 0x7fffffu);
+    const uint e = (est >> 23) - 127u;
+    const uint big = q << e;
+    // floor(B^2 / 4^gap) to within 2 units, from B = hb * 2^gap + rem without a wide product.
+    const uint hb = sig_b >> gap;
+    const uint rem = sig_b - (hb << gap);
+    const int r = int((sig_a - big) * (sig_a + big) + hb * hb + ((2u * hb * rem) >> gap));
+    const int w = int(big << e);
+    const bool pow2 = q == 0x800000u;
+    const bool keep = r >= (pow2 ? 0 : 2 - w) && r < w - 1;
+    const bool up = r >= w + 2 && r < 3 * w - 1;
+    const bool down = !pow2 && r < -w - 1 && r >= (q == 0x800001u ? -2 * w : 10 - 3 * w);
+    if (keep || up || down) {
+        est = est + uint(up) - uint(down);
+    } else {
+        est = hypot_round_exact(est, sig_a, sig_b, gap);
     }
-    if (a < 0x00800000u) {
-        const float r = precise::divide(float(b), float(a));
-        const float root = precise::sqrt(fma(r, r, 1.0f));
-        return scale_f32_u24(root, a, -149);
-    }
-    // `a` is normal and `b` is subnormal. Once `a` reaches 2^-114, `b/a < 2^-12`,
-    // so `(b/a)^2` is strictly below half an ulp of 1 and the hypot is `a`.
-    if ((a >> 23) >= 13u) return a;
-    const float hi = scale_normal(a, 23);
-    const float lo = subnormal_times_2_to_23(b);
-    const float r = precise::divide(lo, hi);
-    const float scaled = hi * precise::sqrt(fma(r, r, 1.0f));
-    return exp_delta(scaled, -23);
+    // est is in [1, 4], so its bits are at least those of 1.0 and the sum cannot wrap.
+    return min((est - 0x3f800000u) + (exp_a << 23), 0x7f800000u);
 }
 
 // L1 magnitude of a complex element: |re| + |im| in f32 (NaN if either part is NaN,
@@ -196,7 +262,7 @@ struct ComplexL1 {
     static uint key(float2 z) { return l1_key(abs_bits(z.x), abs_bits(z.y)); }
 };
 
-// Overflow-safe complex modulus: hi * sqrt(1 + (lo / hi)^2) with hi = max(|re|, |im|).
+// Overflow-safe complex modulus sqrt(re^2 + im^2), correctly rounded to f32 (see hypot_key).
 // NaN if either part is NaN; +inf if either part is infinite; 0 if both parts are zero.
 struct ComplexHypot {
     using Element = float2;
@@ -206,8 +272,8 @@ struct ComplexHypot {
 // Grid-stride serial accumulation over elements start, start + step, ... of the view.
 // Indices ascend, so a strict `>` keeps the lowest index among equal keys.
 template <typename Magnitude>
-inline Candidate scan_view(device const typename Magnitude::Element* x, constant Params& p,
-                           uint start, uint step) {
+inline Candidate scan_view(device const typename Magnitude::Element* x,
+                           constant ArgmaxParams& p, uint start, uint step) {
     if (start >= p.n) return 0;
     uint best_idx = start;
     uint best_key = Magnitude::key(x[p.offset + ulong(start) * p.stride]);
@@ -258,7 +324,7 @@ inline Candidate reduce_threadgroup(Candidate c, threadgroup Candidate* staged, 
 template <typename Magnitude>
 kernel void argmax_single(device const typename Magnitude::Element* x [[buffer(0)]],
                           device uint* out [[buffer(1)]],
-                          constant Params& p [[buffer(2)]],
+                          constant ArgmaxParams& p [[buffer(2)]],
                           uint tid [[thread_position_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]],
                           uint simd_group [[simdgroup_index_in_threadgroup]],
@@ -275,7 +341,7 @@ kernel void argmax_single(device const typename Magnitude::Element* x [[buffer(0
 template <typename Magnitude>
 kernel void argmax_partial(device const typename Magnitude::Element* x [[buffer(0)]],
                            device Candidate* partials [[buffer(1)]],
-                           constant Params& p [[buffer(2)]],
+                           constant ArgmaxParams& p [[buffer(2)]],
                            uint group [[threadgroup_position_in_grid]],
                            uint tid [[thread_position_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]],
@@ -291,13 +357,13 @@ kernel void argmax_partial(device const typename Magnitude::Element* x [[buffer(
 
 #define ARGMAX_SINGLE(NAME, MAGNITUDE)                                                     \
     template [[host_name(NAME)]] kernel void argmax_single<MAGNITUDE>(                     \
-        device const MAGNITUDE::Element*, device uint*, constant Params&, uint, uint, uint, \
-        uint, uint);
+        device const MAGNITUDE::Element*, device uint*, constant ArgmaxParams&, uint, uint, \
+        uint, uint, uint);
 
 #define ARGMAX_PARTIAL(NAME, MAGNITUDE)                                                    \
     template [[host_name(NAME)]] kernel void argmax_partial<MAGNITUDE>(                    \
-        device const MAGNITUDE::Element*, device Candidate*, constant Params&, uint, uint, \
-        uint, uint, uint, uint);
+        device const MAGNITUDE::Element*, device Candidate*, constant ArgmaxParams&, uint, \
+        uint, uint, uint, uint, uint);
 
 ARGMAX_SINGLE("argmax_f32_single", RealMagnitude)
 ARGMAX_SINGLE("argmax_c32_l1_single", ComplexL1)
@@ -309,7 +375,7 @@ ARGMAX_PARTIAL("argmax_c32_hypot_partial", ComplexHypot)
 // Second pass: one threadgroup folds the `groups` candidates and writes the winning index.
 kernel void argmax_final(device const Candidate* partials [[buffer(0)]],
                          device uint* out [[buffer(1)]],
-                         constant Params& p [[buffer(2)]],
+                         constant ArgmaxParams& p [[buffer(2)]],
                          uint tid [[thread_position_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]],
                          uint simd_group [[simdgroup_index_in_threadgroup]],

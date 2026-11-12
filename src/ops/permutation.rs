@@ -71,6 +71,7 @@ struct TileParams {
     dst_offset: u32,
     extent_a: u32,
     extent_b: u32,
+    src_stride_a: u32,
     src_stride_b: u32,
     dst_stride_a: u32,
     outer_rank: u32,
@@ -129,6 +130,13 @@ fn coalesce(shape: &[usize], strides: &[usize]) -> (Vec<usize>, Vec<usize>) {
         out_strides.push(1);
     }
     (out_shape, out_strides)
+}
+
+/// The source's fastest axis: the one with the smallest non-zero stride, preferring the
+/// last axis on ties. Broadcast (zero-stride) axes are never chosen; `None` if every axis is
+/// a broadcast. Expects the output of [`coalesce`], which has no unit-extent axes.
+fn fastest_axis(strides: &[usize]) -> Option<usize> {
+    (0..strides.len()).rev().filter(|&d| strides[d] != 0).min_by_key(|&d| strides[d])
 }
 
 /// Kernel entry point for a path, element width in 32-bit words, and conjugation.
@@ -210,10 +218,10 @@ fn encode_gather<T: Element>(
     let src_offset = to_u32(src.offset, "source offset")?;
     let dst_offset = to_u32(dst.offset, "destination offset")?;
 
-    // The destination's unit-stride axis is the last one. When the source is not unit
-    // stride there but has a unit-stride axis elsewhere, transpose tiles of those two axes.
+    // The destination's fastest axis is the last one. When the source's fastest axis is
+    // another one, transpose tiles of those two axes.
     let b = rank - 1;
-    let tile_axis = if strides[b] == 1 { None } else { (0..b).find(|&a| strides[a] == 1) };
+    let tile_axis = fastest_axis(&strides).filter(|&a| a != b);
 
     let Some(a) = tile_axis else {
         let params = CopyParams {
@@ -249,6 +257,7 @@ fn encode_gather<T: Element>(
         dst_offset,
         extent_a: to_u32(shape[a], "extent")?,
         extent_b: to_u32(shape[b], "extent")?,
+        src_stride_a: to_u32(strides[a], "source stride")?,
         src_stride_b: to_u32(strides[b], "source stride")?,
         dst_stride_a: to_u32(dst_strides[a], "destination stride")?,
         outer_rank: outer.len() as u32,
