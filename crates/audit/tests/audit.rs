@@ -679,15 +679,22 @@ fn cpu_tcp_three_ranks_match_single_rank_bits() {
     assert_payloads(&tcp, m, "tcp");
 }
 
-/// No `dyn` in the pipeline source: `train` is generic over `Backend` and `Transport`.
-fn assert_no_trait_objects(dir: &Path) {
-    for entry in std::fs::read_dir(dir).expect("read dir") {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "rs") {
-            let code = strip_comments(&read(&path)).join("\n");
-            assert!(!code.contains("dyn "), "{} uses a trait object", path.display());
-        }
+/// Whether `code` (comments already stripped) contains `dyn` as a whole identifier token, so
+/// `&dyn Tr`, `Box<dyn\nTr>` and `dyn(Fn())` match but `dynamic` and `my_dyn` do not.
+fn has_dyn_token(code: &str) -> bool {
+    code.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|tok| tok == "dyn")
+}
+
+/// No `dyn` in the pipeline source: `train` is generic over `Backend` and `Transport`. Walks
+/// `dir` recursively and returns how many files it read (it panics if that is none).
+fn assert_no_trait_objects(dir: &Path) -> usize {
+    let files = rust_files(dir);
+    assert!(!files.is_empty(), "no sources under {}", dir.display());
+    for path in &files {
+        let code = strip_comments(&read(path)).join("\n");
+        assert!(!has_dyn_token(&code), "{} uses a trait object", path.display());
     }
+    files.len()
 }
 
 fn assert_cpu_calls(r: &RankResult, ctx: &str) {
@@ -712,7 +719,8 @@ fn assert_cpu_calls(r: &RankResult, ctx: &str) {
 
 #[test]
 fn cpu_launch_names_stay_on_the_cpu_path() {
-    assert_no_trait_objects(&workspace_root().join("crates/pipeline/src"));
+    let scanned = assert_no_trait_objects(&workspace_root().join("crates/pipeline/src"));
+    assert!(scanned > 0, "the trait-object scan read no files");
     let order = [0, 1];
     // Both transports, one generic `run_rank::<Counting<CpuBackend>, _>` instantiation each.
     let single = run_single(&order);
@@ -1179,6 +1187,33 @@ fn source_scan_rules_self_check() {
     let lines =
         strip_comments("#[cfg(test)]\nmod invariants;\n#[cfg(feature = \"cuda\")]\nmod device;\n");
     assert_eq!(find_guards(&lines, &test_only).guarded_mods, vec!["invariants".to_string()]);
+}
+
+/// Whether `assert_no_trait_objects` panics on a scratch source tree.
+fn trait_scan_rejects(name: &str, files: &[(&str, &str)]) -> bool {
+    let dir = scratch_crate(name, files);
+    std::panic::catch_unwind(|| assert_no_trait_objects(&dir)).is_err()
+}
+
+#[test]
+fn trait_object_scan_self_check() {
+    // Review round 2: the scan walks nested files and matches `dyn` as a token.
+    assert!(trait_scan_rejects(
+        "dyn-nested",
+        &[("lib.rs", "mod a;\n"), ("a/b/c.rs", "type T = Box<dyn Tr>;\n")]
+    ));
+    assert!(trait_scan_rejects("dyn-ref", &[("lib.rs", "fn f(x: &dyn Tr) {}\n")]));
+    assert!(trait_scan_rejects("dyn-newline", &[("lib.rs", "type T = Box<dyn\nTr>;\n")]));
+    assert!(trait_scan_rejects("dyn-paren", &[("lib.rs", "type T = Box<dyn(Fn())>;\n")]));
+    assert!(trait_scan_rejects("dyn-tab", &[("lib.rs", "type T = Box<dyn\tTr>;\n")]));
+    assert!(!trait_scan_rejects(
+        "dyn-ident",
+        &[("lib.rs", "let dynamic = 1; let my_dyn = 2; let dyn_x = 3; fn dyna() {}\n")]
+    ));
+    assert!(!trait_scan_rejects("dyn-comment", &[("lib.rs", "// Box<dyn Tr>\n/* dyn Tr */\n")]));
+    assert!(!trait_scan_rejects("dyn-clean", &[("lib.rs", "mod a;\n"), ("a/b.rs", "fn f() {}\n")]));
+    // No sources at all must fail loudly rather than pass vacuously.
+    assert!(trait_scan_rejects("dyn-empty", &[("notes.txt", "dyn Tr\n")]));
 }
 
 #[test]
