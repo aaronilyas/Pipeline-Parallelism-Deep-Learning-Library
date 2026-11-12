@@ -21,6 +21,6 @@ rand_chacha = "=0.10.0"
 rayon = "=1.12.0"
 
 [workspace]
-members = [".", "crates/core"]
-default-members = ["crates/core"]
+members = [".", "crates/core", "crates/cpu"]
+default-members = ["crates/core", "crates/cpu"]
 resolver = "2"
