@@ -731,30 +731,143 @@ fn cpu_launch_names_stay_on_the_cpu_path() {
 
 // ---------------------------------------------------------------- source scan
 
-/// Source lines with `//` and `/* */` comments removed. A `//` inside a string literal also
-/// truncates its line, which can only hide text, never invent it; no scanned source does this.
+/// Source lines with comments removed. Understands what a plain scan would trip over: `//` and
+/// `/*` inside string, byte-string and raw-string literals (`r"…"`, `br#"…"#`, any hash count)
+/// are not comments; a quote inside a char literal (`'"'`, `'\\''`) opens no string; lifetimes
+/// (`'a`) are not char literals; quotes inside comments open nothing; block comments nest, as in
+/// Rust. Literal text is kept verbatim (so a `Mutex` named in a string is still reported: the
+/// scan errs towards flagging). Line numbering is preserved: every `\n` in the input ends a line.
 fn strip_comments(src: &str) -> Vec<String> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Code,
+        Line,
+        Block(usize),
+        Str,
+        Raw(usize),
+    }
+    let chars: Vec<char> = src.chars().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = Vec::new();
-    let mut in_block = false;
-    for line in src.lines() {
-        let mut kept = String::new();
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            if in_block {
-                if c == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    in_block = false;
+    let mut cur = String::new();
+    let mut state = State::Code;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '\n' {
+            out.push(std::mem::take(&mut cur));
+            if matches!(state, State::Line) {
+                state = State::Code;
+            }
+            i += 1;
+            continue;
+        }
+        match state {
+            State::Line => i += 1,
+            State::Block(depth) => {
+                if c == '*' && next == Some('/') {
+                    state = if depth == 1 { State::Code } else { State::Block(depth - 1) };
+                    i += 2;
+                } else if c == '/' && next == Some('*') {
+                    state = State::Block(depth + 1);
+                    i += 2;
+                } else {
+                    i += 1;
                 }
-            } else if c == '/' && chars.peek() == Some(&'/') {
-                break;
-            } else if c == '/' && chars.peek() == Some(&'*') {
-                chars.next();
-                in_block = true;
-            } else {
-                kept.push(c);
+            }
+            State::Str => {
+                cur.push(c);
+                if c == '\\' {
+                    // An escaped newline still ends the line; any other escaped char is literal.
+                    match next {
+                        Some('\n') | None => i += 1,
+                        Some(n) => {
+                            cur.push(n);
+                            i += 2;
+                        }
+                    }
+                } else {
+                    if c == '"' {
+                        state = State::Code;
+                    }
+                    i += 1;
+                }
+            }
+            State::Raw(hashes) => {
+                cur.push(c);
+                i += 1;
+                if c == '"' && (0..hashes).all(|k| chars.get(i + k) == Some(&'#')) {
+                    for _ in 0..hashes {
+                        cur.push('#');
+                    }
+                    i += hashes;
+                    state = State::Code;
+                }
+            }
+            State::Code => {
+                if c == '/' && next == Some('/') {
+                    state = State::Line;
+                    i += 2;
+                } else if c == '/' && next == Some('*') {
+                    state = State::Block(1);
+                    i += 2;
+                } else if c == '"' {
+                    cur.push(c);
+                    state = State::Str;
+                    i += 1;
+                } else if (c == 'r' || c == 'b') && (i == 0 || !is_ident(chars[i - 1])) {
+                    // Possible literal prefix: b"…", r"…", r#"…"#, br#"…"#.
+                    let mut j = i;
+                    if chars[j] == 'b' {
+                        j += 1;
+                    }
+                    let raw = chars.get(j) == Some(&'r');
+                    if raw {
+                        j += 1;
+                    }
+                    let mut hashes = 0;
+                    while raw && chars.get(j + hashes) == Some(&'#') {
+                        hashes += 1;
+                    }
+                    if chars.get(j + hashes) == Some(&'"') && (raw || j > i) {
+                        cur.extend(&chars[i..=j + hashes]);
+                        state = if raw { State::Raw(hashes) } else { State::Str };
+                        i = j + hashes + 1;
+                    } else {
+                        cur.push(c);
+                        i += 1;
+                    }
+                } else if c == '\'' {
+                    // Char literal ('x', '\n', '\'', '\u{…}') or lifetime ('a).
+                    let end = if next == Some('\\') {
+                        let mut j = i + 3;
+                        while j < chars.len() && chars[j] != '\'' && chars[j] != '\n' {
+                            j += 1;
+                        }
+                        (chars.get(j) == Some(&'\'')).then_some(j)
+                    } else {
+                        (chars.get(i + 2) == Some(&'\'') && next != Some('\n')).then_some(i + 2)
+                    };
+                    match end {
+                        Some(j) => {
+                            cur.extend(&chars[i..=j]);
+                            i = j + 1;
+                        }
+                        None => {
+                            cur.push(c);
+                            i += 1;
+                        }
+                    }
+                } else {
+                    cur.push(c);
+                    i += 1;
+                }
             }
         }
-        out.push(kept);
+    }
+    if !(src.is_empty() || src.ends_with('\n')) {
+        out.push(cur);
     }
     out
 }
@@ -899,31 +1012,60 @@ fn unguarded_sync(
     (bad, guarded_hits)
 }
 
-/// Scans every `.rs` under `dir`. A file declared by an accepted `mod name;` in `lib.rs`
-/// (e.g. `#[cfg(test)] mod invariants;`) is wholly guarded. Returns violations and the number
-/// of guarded hits (proof the scan saw the counters).
-fn scan_crate(dir: &Path, allowed: &[String]) -> (Vec<String>, usize) {
+/// Every `.rs` file under `dir`, recursively, sorted.
+fn rust_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        for entry in std::fs::read_dir(&d).unwrap_or_else(|e| panic!("read {}: {e}", d.display())) {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Scans every `.rs` under `dir`, nested directories included. A `mod name;` in `lib.rs` that
+/// carries an accepted guard (e.g. `#[cfg(test)] mod invariants;`) wholly guards `name.rs` and
+/// everything under `name/`. Returns violations, the number of guarded hits (proof the scan
+/// saw the counters) and the number of files scanned (so it cannot pass vacuously).
+fn scan_crate(dir: &Path, allowed: &[String]) -> (Vec<String>, usize, usize) {
     let lib = read(&dir.join("lib.rs"));
     let guarded_mods = find_guards(&strip_comments(&lib), allowed).guarded_mods;
     let mut violations = Vec::new();
     let mut guarded_hits = 0;
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .expect("read src")
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
-        .collect();
-    files.sort();
+    let files = rust_files(dir);
     assert!(!files.is_empty(), "no sources under {}", dir.display());
-    for file in files {
-        let stem = file.file_stem().unwrap().to_string_lossy().to_string();
-        let file_guarded = guarded_mods.contains(&stem);
-        let (bad, hits) = unguarded_sync(&read(&file), allowed, file_guarded);
+    for file in &files {
+        let rel = file.strip_prefix(dir).expect("under dir");
+        let top = rel.components().next().expect("non-empty path").as_os_str();
+        let top = Path::new(top).file_stem().unwrap().to_string_lossy().to_string();
+        let file_guarded = guarded_mods.contains(&top);
+        let (bad, hits) = unguarded_sync(&read(file), allowed, file_guarded);
         guarded_hits += hits;
         for (line, text) in bad {
             violations.push(format!("{}:{line}: {text}", file.display()));
         }
     }
-    (violations, guarded_hits)
+    (violations, guarded_hits, files.len())
+}
+
+/// A throwaway crate `src/` under the cargo target tmpdir with the given `(relative path,
+/// contents)` files; returns the `src/` directory.
+fn scratch_crate(name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("audit-scan").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    for (rel, text) in files {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create scratch dir");
+        std::fs::write(&path, text).expect("write scratch file");
+    }
+    dir
 }
 
 #[test]
@@ -961,6 +1103,79 @@ fn source_scan_rules_self_check() {
     let module = "#[cfg(test)]\nmod tests {\n    use std::sync::Mutex;\n    fn g() {\n        let _m = Mutex::new(0);\n    }\n}\nstatic X: Mutex<u8> = todo();\n";
     assert_eq!(unguarded_sync(module, &test_only, false).0.len(), 1, "after the test module");
 
+    // Review round 1, finding 1: comment stripping must understand literals and nesting.
+    let m = "let m = Mutex::new(0);";
+    let hidden = |prefix: &str| format!("{prefix}{m}\n");
+    assert_eq!(flagged(&hidden("let _ = \"//\"; "), &test_only), 1, "// in a string");
+    assert_eq!(flagged(&hidden("let _ = r\"//\"; "), &test_only), 1, "// in a raw string");
+    assert_eq!(flagged(&hidden("let _ = r#\"a\"//b\"#; "), &test_only), 1, "// in r#\"..\"#");
+    assert_eq!(flagged(&hidden("let _ = br##\"//\"#\"##; "), &test_only), 1, "// in br##\"..\"##");
+    assert_eq!(flagged(&hidden("let _ = b\"//\"; "), &test_only), 1, "// in a byte string");
+    assert_eq!(flagged(&hidden("let _ = \"a\\\"//\"; "), &test_only), 1, "escaped quote in string");
+    assert_eq!(flagged(&format!("let s = \"/*\";\n{m}\n"), &test_only), 1, "/* in a string");
+    assert_eq!(
+        flagged(&format!("let s = \"a\n// b\";\n{m}\n"), &test_only),
+        1,
+        "multi-line string"
+    );
+    assert_eq!(flagged(&hidden("let q = '\"'; "), &test_only), 1, "quote char literal");
+    assert_eq!(flagged(&hidden("let q = '\\''; "), &test_only), 1, "escaped quote char literal");
+    assert_eq!(
+        flagged(&hidden("let q = '/'; let r = '/'; "), &test_only),
+        1,
+        "slash char literals"
+    );
+    assert_eq!(flagged(&format!("fn f<'a>(x: &'a str) {{ {m} }}\n"), &test_only), 1, "lifetimes");
+    assert_eq!(flagged(&format!("/* \" */ {m}\n"), &test_only), 1, "quote inside a block comment");
+    assert_eq!(
+        flagged(&format!("// \" not a string\n{m}\n"), &test_only),
+        1,
+        "quote in a line comment"
+    );
+    assert_eq!(flagged("/* a /* nested Mutex */ still Mutex */\n", &test_only), 0, "nested block");
+    assert_eq!(flagged(&format!("/* a /* b */ c */ {m}\n"), &test_only), 1, "code after nesting");
+    assert_eq!(
+        flagged("let s = \"// Mutex\";\n", &test_only),
+        1,
+        "Mutex text in a string stays flagged"
+    );
+    let spread = strip_comments("let a = 1; /* x\n y */ let b = 2;\n");
+    assert_eq!(spread.len(), 2, "line numbering survives block comments");
+    assert_eq!(spread[1].trim(), "let b = 2;");
+
+    // Review round 1, finding 2: nested source files are scanned.
+    let nested = scratch_crate(
+        "nested",
+        &[
+            ("lib.rs", "mod a;\n"),
+            ("a/mod.rs", "mod deep;\n"),
+            ("a/deep.rs", "fn f() {\n    let _m = Mutex::new(0);\n}\n"),
+        ],
+    );
+    let (bad, _, seen) = scan_crate(&nested, &test_only);
+    assert_eq!(seen, 3, "lib.rs, a/mod.rs and a/deep.rs are all read");
+    assert_eq!(bad.len(), 1, "unguarded Mutex in src/a/deep.rs: {bad:?}");
+    assert!(bad[0].contains("deep.rs:2:"), "{bad:?}");
+
+    // A guarded `mod a;` guards the whole subtree; an unrelated nested file of the same stem
+    // as a guarded top-level module is not exempted by it.
+    let guarded = scratch_crate(
+        "nested-guarded",
+        &[
+            ("lib.rs", "#[cfg(test)]\nmod a;\n#[cfg(test)]\nmod inv;\nmod b;\n"),
+            ("a/mod.rs", "mod deep;\n"),
+            ("a/deep.rs", "fn f() { let _m = Mutex::new(0); }\n"),
+            ("inv.rs", "fn g() { let _m = Mutex::new(0); }\n"),
+            ("b/mod.rs", "mod inv;\n"),
+            ("b/inv.rs", "fn h() { let _m = Mutex::new(0); }\n"),
+        ],
+    );
+    let (bad, hits, seen) = scan_crate(&guarded, &test_only);
+    assert_eq!(seen, 6);
+    assert_eq!(hits, 2, "a/deep.rs and inv.rs are guarded hits");
+    assert_eq!(bad.len(), 1, "only b/inv.rs is unguarded: {bad:?}");
+    assert!(bad[0].contains("b/inv.rs:1:"), "{bad:?}");
+
     let lines =
         strip_comments("#[cfg(test)]\nmod invariants;\n#[cfg(feature = \"cuda\")]\nmod device;\n");
     assert_eq!(find_guards(&lines, &test_only).guarded_mods, vec!["invariants".to_string()]);
@@ -980,18 +1195,24 @@ fn release_cpu_builds_without_counters() {
         allowed_guards(&["#[cfg(test)]", "#[cfg(any(test, feature = \"debug-counters\"))]"]);
     let mut violations = Vec::new();
     let mut vacuous = Vec::new();
+    let mut empty = Vec::new();
     for (crate_dir, allowed, label) in [
         ("cpu", &cpu_allowed, "cfg(test)"),
         ("metal", &accel_allowed, "cfg(any(test, feature = \"debug-counters\"))"),
         ("cuda", &accel_allowed, "cfg(any(test, feature = \"debug-counters\"))"),
     ] {
-        let (bad, guarded) = scan_crate(&root.join("crates").join(crate_dir).join("src"), allowed);
+        let src = root.join("crates").join(crate_dir).join("src");
+        let (bad, guarded, files) = scan_crate(&src, allowed);
+        if files == 0 {
+            empty.push(crate_dir);
+        }
         if guarded == 0 {
             vacuous.push(crate_dir);
         }
         violations.extend(bad.into_iter().map(|v| format!("[{crate_dir}, needs {label}] {v}")));
     }
     assert!(violations.is_empty(), "Mutex/atomic outside their guard:\n{}", violations.join("\n"));
+    assert!(empty.is_empty(), "the scan read no source files in {empty:?} (vacuous)");
     assert!(vacuous.is_empty(), "the scan saw no guarded counters in {vacuous:?} (vacuous)");
 
     // The release build itself.
