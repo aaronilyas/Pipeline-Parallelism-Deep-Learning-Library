@@ -975,8 +975,8 @@ fn bench_latency_and_bandwidth() {
     let mut r = rng(30);
     println!("\nargmax f32 (sync = encode+commit+wait wall time, gpu = GPUEnd-GPUStart), median");
     println!(
-        "{:>10} {:>12} {:>12} {:>12} {:>10}",
-        "N", "sync us", "gpu us", "base gpu us", "GB/s(gpu)"
+        "{:>10} {:>10} {:>10} {:>14} {:>13} {:>10}",
+        "N", "sync us", "gpu us", "base sync us", "base gpu us", "GB/s(gpu)"
     );
     let pso = linalg::abi::compute_pipeline(
         &c,
@@ -1003,32 +1003,34 @@ fn bench_latency_and_bandwidth() {
                 })
                 .collect(),
         );
-        // Baseline: same bytes, 1024 groups x 256 threads, no tie logic and no second pass.
+        // Baseline: same bytes, up to 1024 groups x 256 threads, no tie logic and no second pass.
         let n4 = (n / 4) as u32;
         let threads = (n4 as usize).clamp(1, 1024 * 256);
         let partials = alloc_shared::<f32>(&c, threads);
-        let base = median(
-            (0..200)
-                .map(|_| {
-                    let cmd = c.queue.new_command_buffer();
-                    let enc = cmd.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(&pso);
-                    enc.set_buffer(0, Some(&xb), 0);
-                    enc.set_buffer(1, Some(&partials), 0);
-                    enc.set_bytes(2, 4, (&n4 as *const u32).cast());
-                    enc.dispatch_threads(
-                        metal::MTLSize::new(threads as u64, 1, 1),
-                        metal::MTLSize::new(256.min(threads) as u64, 1, 1),
-                    );
-                    enc.end_encoding();
-                    cmd.commit();
-                    cmd.wait_until_completed();
-                    gpu_us(cmd)
-                })
-                .collect(),
-        );
+        let run_base = || {
+            let started = std::time::Instant::now();
+            let cmd = c.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&xb), 0);
+            enc.set_buffer(1, Some(&partials), 0);
+            enc.set_bytes(2, 4, (&n4 as *const u32).cast());
+            enc.dispatch_threads(
+                metal::MTLSize::new(threads as u64, 1, 1),
+                metal::MTLSize::new(256.min(threads) as u64, 1, 1),
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            (started.elapsed().as_secs_f64() * 1e6, gpu_us(cmd))
+        };
+        for _ in 0..5 {
+            run_base();
+        }
+        let (base_wall, base): (Vec<f64>, Vec<f64>) = (0..200).map(|_| run_base()).unzip();
+        let (base_sync, base) = (median(base_wall), median(base));
         let gbs = (n * 4) as f64 / (gpu * 1e-6) / 1e9;
-        println!("{n:>10} {sync:>12.1} {gpu:>12.1} {base:>12.1} {gbs:>10.1}");
+        println!("{n:>10} {sync:>10.1} {gpu:>10.1} {base_sync:>14.1} {base:>13.1} {gbs:>10.1}");
     }
 }
 
