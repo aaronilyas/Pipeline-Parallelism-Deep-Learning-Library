@@ -45,6 +45,9 @@ fn rng(seed: u64) -> ChaCha8Rng {
     ChaCha8Rng::seed_from_u64(seed)
 }
 
+/// Host view of a shared buffer's words. The memory is externally mutable (shared with the
+/// GPU), so a mutable slice from a shared reference is the intended model here.
+#[allow(clippy::mut_from_ref)]
 fn words_mut(buf: &metal::BufferRef) -> &mut [u32] {
     // SAFETY: shared buffer, no command buffer in flight while tests touch it on the host.
     unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut u32, buf.length() as usize / 4) }

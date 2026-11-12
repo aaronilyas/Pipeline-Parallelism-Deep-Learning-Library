@@ -55,7 +55,6 @@ impl Element for [f32; 2] {
 
 /// Parameters of the strided-copy kernels. Mirrors `CopyParams` in the shader.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
 struct CopyParams {
     count: u32,
     rank: u32,
@@ -67,7 +66,6 @@ struct CopyParams {
 
 /// Parameters of the tiled transpose kernels. Mirrors `TileParams` in the shader.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
 struct TileParams {
     src_offset: u32,
     dst_offset: u32,
