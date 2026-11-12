@@ -34,22 +34,20 @@ use linalg_cpu::CpuBackend;
 use linalg_cuda::CudaBackend;
 use linalg_pipeline::{contiguous_placement, train, Placement};
 
-// ---------------------------------------------------------------- expectation knobs
+// ---------------------------------------------------------------- contract constants
 
 /// The one default member that must not exist: the legacy root package.
-const LEGACY_DEFAULT_MEMBER: &str = "crates/core";
+const LEGACY_DEFAULT_MEMBER: &str = ".";
 /// A dependency that metal and cuda must not have.
-const BANNED_BACKEND_DEP: &str = "linalg-core";
+const BANNED_BACKEND_DEP: &str = "linalg-cpu";
 /// Whether the feature-off / off-macOS stubs report `UnsupportedDevice`.
-const STUB_REPORTS_UNSUPPORTED: bool = false;
+const STUB_REPORTS_UNSUPPORTED: bool = true;
 /// Bytes before the shape words of a wire frame: magic, version, dtype tag, ndim.
-const WIRE_HEADER_BYTES: usize = 8;
+const WIRE_HEADER_BYTES: usize = 16;
 /// The only compute methods a CPU rank may call.
-const EXPECTED_CPU_COMPUTE: [&str; 3] = ["gemm", "gelu", "gelu"];
+const EXPECTED_CPU_COMPUTE: [&str; 3] = ["gemm", "gelu", "gelu_backward"];
 /// The guard attribute the cpu crate must put on every Mutex and atomic.
-const CPU_GUARD: &str = "#[cfg(feature=\"debug-counters\")]";
-/// Extra downloads tolerated on top of the sends of an accelerator rank.
-const DOWNLOAD_SLACK: u64 = 1;
+const CPU_GUARD: &str = "#[cfg(test)]";
 
 // ---------------------------------------------------------------- fixture
 
@@ -443,15 +441,17 @@ fn inner_run() -> bool {
     std::env::var_os("LINALG_AUDIT_INNER").is_some_and(|v| v == "1")
 }
 
-/// A cargo child with its own target dir (so the outer build lock is not contended) and the
-/// recursion guard set.
+/// A cargo child with its own target dir (so the outer build lock is not contended), the
+/// recursion guard set, and the CUDA expectation cleared.
 fn cargo(target_subdir: &str) -> Command {
     let root = workspace_root();
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.current_dir(&root)
         .env("CARGO_TARGET_DIR", root.join("target").join(target_subdir))
-        .env("LINALG_AUDIT_INNER", "1");
+        .env("LINALG_AUDIT_INNER", "1")
+        // The child builds with default features, so a CUDA device cannot be expected of it.
+        .env_remove("LINALG_AUDIT_EXPECT_CUDA");
     cmd
 }
 
@@ -496,7 +496,7 @@ fn workspace_default_test_does_not_build_legacy_linalg() {
     let members = default_members(&manifest);
     assert!(!members.is_empty(), "default-members is non-empty");
     assert!(
-        !members.iter().any(|m| m == LEGACY_DEFAULT_MEMBER || m == "."),
+        !members.iter().any(|m| m == LEGACY_DEFAULT_MEMBER),
         "default-members {members:?} must not contain the legacy root package"
     );
     assert!(
@@ -524,7 +524,7 @@ fn workspace_default_test_does_not_build_legacy_linalg() {
     let artifacts: Vec<&str> =
         stdout.lines().filter(|l| l.contains("\"reason\":\"compiler-artifact\"")).collect();
     assert!(
-        artifacts.iter().any(|l| l.contains("\"name\":\"linalg-core\"")),
+        artifacts.iter().any(|l| l.contains("\"name\":\"linalg_core\"")),
         "the inner run built the workspace crates (scan is not vacuous)"
     );
     let legacy: Vec<&&str> = artifacts.iter().filter(|l| is_legacy_artifact(l, &root)).collect();
@@ -1055,11 +1055,7 @@ fn assert_heterogeneous(
 
     // Downloads equal sends: the only bytes the accelerator rank reads back are its boundary.
     assert_eq!(accel.sent.len(), m, "rank 1 sends one dx per microbatch");
-    assert_eq!(
-        accel.downloads,
-        accel.sent.len() as u64 + DOWNLOAD_SLACK,
-        "rank 1 downloads = sends"
-    );
+    assert_eq!(accel.downloads, accel.sent.len() as u64, "rank 1 downloads = sends");
 }
 
 #[cfg(target_os = "macos")]
