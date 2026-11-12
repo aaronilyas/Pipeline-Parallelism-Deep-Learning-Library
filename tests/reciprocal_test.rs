@@ -157,11 +157,18 @@ fn ulp_distance(got: f32, want: f32) -> u64 {
     u64::from((got.to_bits() & 0x7fff_ffff).abs_diff(want.to_bits() & 0x7fff_ffff))
 }
 
+/// `distance <= REAL_ULP_GATE`. Kept as a function because an `allow` on `assert!` is ignored,
+/// and the gate is 0 today, which makes `<=` look like an equality to clippy.
+#[allow(clippy::absurd_extreme_comparisons)]
+fn within_real_gate(distance: u64) -> bool {
+    distance <= REAL_ULP_GATE
+}
+
 /// Asserts the real gate for one input.
 fn assert_real(x: f32, got: f32) {
     let want = reference_real(x);
     assert!(
-        ulp_distance(got, want) <= REAL_ULP_GATE,
+        within_real_gate(ulp_distance(got, want)),
         "1/{x:e} ({:#010x}): got {:#010x}, want {:#010x}",
         x.to_bits(),
         got.to_bits(),
@@ -1308,7 +1315,7 @@ fn sweep_real_exhaustive() {
         histogram.total() as f64 / gpu_seconds / 1e6
     );
     assert_eq!(histogram.total(), (range.end - range.start) * BLOCK as u64);
-    assert!(histogram.max_distance() <= REAL_ULP_GATE);
+    assert!(within_real_gate(histogram.max_distance()));
 }
 
 /// Outcome of a complex sweep block: componentwise ULP histogram, gate violations, and the
