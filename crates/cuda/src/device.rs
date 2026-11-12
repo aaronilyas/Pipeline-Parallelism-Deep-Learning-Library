@@ -1,15 +1,22 @@
 //! CUDA device backend (feature `cuda`).
 //!
-//! RED stub: alloc/upload/download talk to the device; gemm/gelu are intentional
-//! no-ops that return `Ok` so tests fail on value and counter assertions.
+//! f32 gemm is one cuBLAS `sgemm` named `gemm-f32-cublas`. GELU and GELU' are
+//! NVRTC kernels compiled once for `compute_61` in [`CudaBackend::new`].
 
 use std::sync::Arc;
 
 #[cfg(any(test, feature = "debug-counters"))]
 use std::sync::Mutex;
 
-use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
+use cudarc::cublas::{result as cublas_result, sys as cublas_sys, CudaBlas};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
+    PushKernelArg,
+};
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use linalg_core::{row_major_strides, Backend, DType, DeviceKind, Error, Identified, Tensor};
+
+const GELU_SRC: &str = include_str!("../gelu.cu");
 
 #[cfg(any(test, feature = "debug-counters"))]
 struct Stats {
@@ -17,8 +24,6 @@ struct Stats {
     downloads: u64,
     uploads: u64,
     launches: Vec<&'static str>,
-    /// Deliberately unstable write pattern for RED `repeated_gemm_is_bitwise_stable`.
-    gemm_calls: u64,
 }
 
 struct DeviceBuf {
@@ -52,7 +57,12 @@ impl Identified for CudaStore {
 
 /// CUDA backend. Construct with [`CudaBackend::new`].
 pub struct CudaBackend {
-    stream: Arc<cudarc::driver::CudaStream>,
+    stream: Arc<CudaStream>,
+    blas: CudaBlas,
+    gelu: CudaFunction,
+    gelu_backward: CudaFunction,
+    /// Keeps the NVRTC module alive for the function handles.
+    _module: Arc<CudaModule>,
     #[cfg(any(test, feature = "debug-counters"))]
     stats: Mutex<Stats>,
 }
@@ -61,16 +71,26 @@ impl CudaBackend {
     pub fn new() -> Result<Self, Error> {
         let ctx = CudaContext::new(0).map_err(|_| Error::UnsupportedDevice)?;
         let stream = ctx.default_stream();
+        let blas = CudaBlas::new(stream.clone()).map_err(|_| Error::Schedule)?;
+
+        let ptx = compile_ptx_with_opts(
+            GELU_SRC,
+            CompileOptions { arch: Some("compute_61"), ..Default::default() },
+        )
+        .map_err(|_| Error::Schedule)?;
+        let module = ctx.load_module(ptx).map_err(|_| Error::Schedule)?;
+        let gelu = module.load_function("gelu_kernel").map_err(|_| Error::Schedule)?;
+        let gelu_backward =
+            module.load_function("gelu_backward_kernel").map_err(|_| Error::Schedule)?;
+
         Ok(Self {
             stream,
+            blas,
+            gelu,
+            gelu_backward,
+            _module: module,
             #[cfg(any(test, feature = "debug-counters"))]
-            stats: Mutex::new(Stats {
-                allocs: 0,
-                downloads: 0,
-                uploads: 0,
-                launches: Vec::new(),
-                gemm_calls: 0,
-            }),
+            stats: Mutex::new(Stats { allocs: 0, downloads: 0, uploads: 0, launches: Vec::new() }),
         })
     }
 
@@ -194,45 +214,131 @@ impl Backend for CudaBackend {
         a: &Tensor<Self::Store>,
         b: &Tensor<Self::Store>,
         c: &mut Tensor<Self::Store>,
-        _alpha: f32,
-        _beta: f32,
+        alpha: f32,
+        beta: f32,
     ) -> Result<(), Error> {
-        let _ = (a, b);
-        // RED: wrong launch name, extra alloc bump, byte-fill that changes per call.
-        self.bump_allocs();
-        self.record("gemm-stub");
-        #[cfg(any(test, feature = "debug-counters"))]
-        let pattern = {
-            let mut stats = self.stats.lock().expect("cuda stats");
-            stats.gemm_calls += 1;
-            (stats.gemm_calls & 0xff) as u8
-        };
-        #[cfg(not(any(test, feature = "debug-counters")))]
-        let pattern = 0xabu8;
-        let nbytes = c.storage.buf.nbytes;
-        if nbytes > 0 {
-            // SAFETY: writes `c`'s device bytes through its stored pointer. Valid
-            // because Backend callers never race another write on this storage_id,
-            // and `ptr`/`nbytes` describe the live allocation in `c.storage`.
-            unsafe {
-                cudarc::driver::result::memset_d8_async(
-                    c.storage.buf.ptr,
-                    pattern,
-                    nbytes,
-                    self.stream.cu_stream(),
-                )
-            }
-            .map_err(|_| Error::Schedule)?;
-            self.stream.synchronize().map_err(|_| Error::Schedule)?;
+        let (m, k) = matrix_dims(a)?;
+        let (k_b, n) = matrix_dims(b)?;
+        let (m_c, n_c) = matrix_dims(c)?;
+        if k != k_b || m != m_c || n != n_c {
+            return Err(Error::Shape);
         }
+        if a.dtype != b.dtype || a.dtype != c.dtype {
+            return Err(Error::Dtype);
+        }
+
+        let a_id = a.storage.storage_id();
+        let b_id = b.storage.storage_id();
+        let c_id = c.storage.storage_id();
+        if a_id == b_id || a_id == c_id || b_id == c_id {
+            return Err(Error::Alias);
+        }
+
+        let a_layout = matrix_layout(a)?;
+        let b_layout = matrix_layout(b)?;
+        let c_layout = matrix_layout(c)?;
+        let supported = matches!(
+            (a_layout, b_layout, c_layout),
+            (MatrixLayout::RowMajor, MatrixLayout::RowMajor, MatrixLayout::RowMajor)
+                | (MatrixLayout::Transposed, MatrixLayout::RowMajor, MatrixLayout::RowMajor)
+                | (MatrixLayout::RowMajor, MatrixLayout::Transposed, MatrixLayout::RowMajor)
+        );
+        if !supported {
+            return Err(Error::UnsupportedLayout);
+        }
+
+        match a.dtype {
+            DType::F16 | DType::BF16 => {
+                // Spec: f16 and bf16 launch nothing.
+                return Ok(());
+            }
+            DType::F32 => {}
+        }
+
+        let c_bytes = m.checked_mul(n).and_then(|x| x.checked_mul(4)).ok_or(Error::Shape)?;
+        if c_bytes > c.storage.buf.nbytes {
+            return Err(Error::Shape);
+        }
+        if alpha != 0.0 && k > 0 {
+            let a_bytes = m.checked_mul(k).and_then(|x| x.checked_mul(4)).ok_or(Error::Shape)?;
+            let b_bytes = k.checked_mul(n).and_then(|x| x.checked_mul(4)).ok_or(Error::Shape)?;
+            if a_bytes > a.storage.buf.nbytes || b_bytes > b.storage.buf.nbytes {
+                return Err(Error::Shape);
+            }
+        }
+
+        // K==0 with beta==0: cuBLAS may skip writing C. One device memset zeros C.
+        if k == 0 && beta == 0.0 {
+            if c_bytes > 0 {
+                // SAFETY: exclusive write to `c` under Backend's caller obligation;
+                // `ptr`/`c_bytes` describe the live allocation.
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        c.storage.buf.ptr,
+                        0,
+                        c_bytes,
+                        self.stream.cu_stream(),
+                    )
+                }
+                .map_err(|_| Error::Schedule)?;
+            }
+            self.record("gemm-f32-cublas");
+            return Ok(());
+        }
+
+        // Row-major C = A B via column-major identity C^T = B^T A^T: one sgemm
+        // with operands swapped. A transpose_matrix view is an OP_T flag.
+        let (trans_b, ldb) = match b_layout {
+            MatrixLayout::RowMajor => (cublas_sys::cublasOperation_t::CUBLAS_OP_N, n as i32),
+            MatrixLayout::Transposed => (cublas_sys::cublasOperation_t::CUBLAS_OP_T, k as i32),
+        };
+        let (trans_a, lda) = match a_layout {
+            MatrixLayout::RowMajor => (cublas_sys::cublasOperation_t::CUBLAS_OP_N, k as i32),
+            MatrixLayout::Transposed => (cublas_sys::cublasOperation_t::CUBLAS_OP_T, m as i32),
+        };
+
+        // SAFETY: pointers are live device allocations for a/b/c; dims/ld match
+        // the layouts above; Backend callers do not race writes on these ids.
+        // cuBLAS with beta==0 does not read C (NaN-safe).
+        unsafe {
+            cublas_result::sgemm(
+                *self.blas.handle(),
+                trans_b,
+                trans_a,
+                n as i32,
+                m as i32,
+                k as i32,
+                &alpha,
+                b.storage.buf.ptr as *const f32,
+                ldb,
+                a.storage.buf.ptr as *const f32,
+                lda,
+                &beta,
+                c.storage.buf.ptr as *mut f32,
+                n as i32,
+            )
+        }
+        .map_err(|_| Error::Schedule)?;
+
+        self.record("gemm-f32-cublas");
         Ok(())
     }
 
     fn gelu(&self, x: &Tensor<Self::Store>, y: &mut Tensor<Self::Store>) -> Result<(), Error> {
-        let _ = (x, y);
-        // RED: pretend to download and do not write y.
-        self.bump_downloads();
-        self.record("gelu-stub");
+        let n = prepare_f32_row_major(&[x, y])?;
+        if x.storage.storage_id() == y.storage.storage_id() {
+            return Err(Error::Alias);
+        }
+        let n_i32 = i32::try_from(n).map_err(|_| Error::Shape)?;
+        let mut builder = self.stream.launch_builder(&self.gelu);
+        builder.arg(&y.storage.buf.slice);
+        builder.arg(&x.storage.buf.slice);
+        builder.arg(&n_i32);
+        let cfg = LaunchConfig::for_num_elems(n.max(1) as u32);
+        // SAFETY: kernel writes `y` and reads `x`; lengths are `n` f32 elements;
+        // Backend callers do not race these storage_ids.
+        unsafe { builder.launch(cfg) }.map_err(|_| Error::Schedule)?;
+        self.record("gelu-cuda");
         Ok(())
     }
 
@@ -242,8 +348,24 @@ impl Backend for CudaBackend {
         dy: &Tensor<Self::Store>,
         dx: &mut Tensor<Self::Store>,
     ) -> Result<(), Error> {
-        let _ = (pre, dy, dx);
-        self.record("gelu-backward-stub");
+        let n = prepare_f32_row_major(&[pre, dy, dx])?;
+        let pre_id = pre.storage.storage_id();
+        let dy_id = dy.storage.storage_id();
+        let dx_id = dx.storage.storage_id();
+        if pre_id == dy_id || pre_id == dx_id || dy_id == dx_id {
+            return Err(Error::Alias);
+        }
+        let n_i32 = i32::try_from(n).map_err(|_| Error::Shape)?;
+        let mut builder = self.stream.launch_builder(&self.gelu_backward);
+        builder.arg(&dx.storage.buf.slice);
+        builder.arg(&pre.storage.buf.slice);
+        builder.arg(&dy.storage.buf.slice);
+        builder.arg(&n_i32);
+        let cfg = LaunchConfig::for_num_elems(n.max(1) as u32);
+        // SAFETY: kernel writes `dx` and reads `pre`/`dy`; lengths are `n` f32
+        // elements; Backend callers do not race these storage_ids.
+        unsafe { builder.launch(cfg) }.map_err(|_| Error::Schedule)?;
+        self.record("gelu-backward-cuda");
         Ok(())
     }
 
@@ -302,4 +424,65 @@ fn checked_nbytes(dtype: DType, shape: &[usize]) -> Result<usize, Error> {
         numel = numel.checked_mul(extent).ok_or(Error::Shape)?;
     }
     numel.checked_mul(dtype.size_of()).ok_or(Error::Shape)
+}
+
+fn matrix_dims(tensor: &Tensor<CudaStore>) -> Result<(usize, usize), Error> {
+    if tensor.shape.len() != 2 || tensor.strides.len() != 2 {
+        return Err(Error::Shape);
+    }
+    Ok((tensor.shape[0], tensor.shape[1]))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatrixLayout {
+    RowMajor,
+    Transposed,
+}
+
+fn matrix_layout(tensor: &Tensor<CudaStore>) -> Result<MatrixLayout, Error> {
+    if tensor.offset != 0 {
+        return Err(Error::UnsupportedLayout);
+    }
+    if tensor.strides == row_major_strides(&tensor.shape) {
+        return Ok(MatrixLayout::RowMajor);
+    }
+    // `transpose_matrix` of row-major `[cols, rows]` yields strides `[1, rows]`.
+    if tensor.strides[0] == 1 && tensor.strides[1] == tensor.shape[0] {
+        return Ok(MatrixLayout::Transposed);
+    }
+    Err(Error::UnsupportedLayout)
+}
+
+fn prepare_f32_row_major(tensors: &[&Tensor<CudaStore>]) -> Result<usize, Error> {
+    for tensor in tensors {
+        if tensor.dtype != DType::F32 {
+            return Err(Error::Dtype);
+        }
+    }
+    let shape = &tensors[0].shape;
+    for tensor in tensors.iter().skip(1) {
+        if tensor.shape != *shape {
+            return Err(Error::Shape);
+        }
+    }
+    let packed = row_major_strides(shape);
+    for tensor in tensors {
+        if tensor.offset != 0 || tensor.strides != packed {
+            return Err(Error::UnsupportedLayout);
+        }
+    }
+    let count = {
+        let mut n = 1usize;
+        for &extent in shape.iter() {
+            n = n.checked_mul(extent).ok_or(Error::Shape)?;
+        }
+        n
+    };
+    let bytes = count.checked_mul(DType::F32.size_of()).ok_or(Error::Shape)?;
+    for tensor in tensors {
+        if tensor.storage.buf.nbytes < bytes {
+            return Err(Error::Shape);
+        }
+    }
+    Ok(count)
 }

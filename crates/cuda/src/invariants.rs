@@ -1,8 +1,14 @@
-use crate::{CudaBackend, CudaStore};
+use crate::CudaBackend;
+use linalg_core::Error;
+
+#[cfg(feature = "cuda")]
+use crate::CudaStore;
+#[cfg(feature = "cuda")]
 use linalg_core::{
-    row_major_strides, transpose_matrix, Backend, DType, DeviceKind, Error, Identified, Tensor,
+    row_major_strides, transpose_matrix, Backend, DType, DeviceKind, Identified, Tensor,
 };
 
+#[cfg(feature = "cuda")]
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 4);
     for value in values {
@@ -11,14 +17,17 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "cuda")]
 fn f32_values(bytes: &[u8]) -> Vec<f32> {
     bytes.chunks_exact(4).map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap())).collect()
 }
 
+#[cfg(feature = "cuda")]
 fn upload_f32(backend: &CudaBackend, shape: &[usize], values: &[f32]) -> Tensor<CudaStore> {
     backend.upload(DType::F32, shape, &f32_bytes(values)).unwrap()
 }
 
+#[cfg(feature = "cuda")]
 fn metal_fixture(rows: usize, cols: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(rows * cols);
     for i in 0..rows {
@@ -29,6 +38,8 @@ fn metal_fixture(rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn gemm_f64(
     m: usize,
     n: usize,
@@ -57,6 +68,7 @@ fn gemm_f64(
     out
 }
 
+#[cfg(feature = "cuda")]
 fn transposed(
     backend: &CudaBackend,
     logical_rows: usize,
@@ -78,6 +90,7 @@ fn transposed(
     view
 }
 
+#[cfg(feature = "cuda")]
 fn assert_close(got: &[f32], expected: &[f64], tol: f64) {
     assert_eq!(got.len(), expected.len());
     for (index, (g, e)) in got.iter().zip(expected).enumerate() {
@@ -155,7 +168,7 @@ fn transposed_operand_does_not_allocate() {
     let b = metal_fixture(4, 6);
     let a_t = transposed(&backend, 8, 4, &a);
     let b_rm = upload_f32(&backend, &[4, 6], &b);
-    let mut c = upload_f32(&backend, &[8, 6], &vec![0.0; 8 * 6]);
+    let mut c = upload_f32(&backend, &[8, 6], &[0.0; 8 * 6]);
     let before = backend.debug_allocs();
     backend.gemm(&a_t, &b_rm, &mut c, 1.0, 0.0).unwrap();
     assert_eq!(backend.debug_allocs(), before, "transposed gemm must not allocate a packed copy");
@@ -183,8 +196,8 @@ fn gelu_does_not_download() {
     backend.gelu(&x, &mut y).unwrap();
     assert_eq!(backend.debug_downloads(), before, "gelu must not download to the host");
     let got = f32_values(&backend.download(&y).unwrap());
-    for (index, (&g, &x)) in got.iter().zip(&xs).enumerate() {
-        let expected = 0.5 * x * (1.0 + erf_ref(x / std::f32::consts::SQRT_2));
+    for (index, (&g, &xv)) in got.iter().zip(&xs).enumerate() {
+        let expected = 0.5 * xv * (1.0 + erf_ref(xv / std::f32::consts::SQRT_2));
         assert!((g - expected).abs() <= 1e-5, "index {index}: got {g} expected {expected}");
     }
 }
@@ -198,11 +211,11 @@ fn repeated_gemm_is_bitwise_stable() {
     let a_t = upload_f32(&backend, &[16, 16], &a);
     let b_t = upload_f32(&backend, &[16, 16], &b);
 
-    let mut c1 = upload_f32(&backend, &[16, 16], &vec![0.0; 256]);
+    let mut c1 = upload_f32(&backend, &[16, 16], &[0.0; 256]);
     backend.gemm(&a_t, &b_t, &mut c1, 1.0, 0.0).unwrap();
     let d1 = backend.download(&c1).unwrap();
 
-    let mut c2 = upload_f32(&backend, &[16, 16], &vec![0.0; 256]);
+    let mut c2 = upload_f32(&backend, &[16, 16], &[0.0; 256]);
     backend.gemm(&a_t, &b_t, &mut c2, 1.0, 0.0).unwrap();
     let d2 = backend.download(&c2).unwrap();
 
@@ -260,7 +273,7 @@ fn gemm_k_zero_beta_zero_writes_zeros() {
     let backend = require_device();
     let a = upload_f32(&backend, &[3, 0], &[]);
     let b = upload_f32(&backend, &[0, 4], &[]);
-    let mut c = upload_f32(&backend, &[3, 4], &vec![1.0; 12]);
+    let mut c = upload_f32(&backend, &[3, 4], &[1.0; 12]);
     backend.gemm(&a, &b, &mut c, 1.0, 0.0).unwrap();
     let got = f32_values(&backend.download(&c).unwrap());
     assert_eq!(got, vec![0.0; 12]);
@@ -289,27 +302,32 @@ fn gelu_backward_within_1e_5() {
     backend.gelu_backward(&pre, &dy, &mut dx).unwrap();
     assert_eq!(backend.debug_launches().last().copied(), Some("gelu-backward-cuda"));
     let got = f32_values(&backend.download(&dx).unwrap());
-    for (index, ((&g, &x), &dy)) in got.iter().zip(&xs).zip(&dys).enumerate() {
-        let expected = dy * gelu_prime_ref(x);
+    for (index, ((&g, &x), &dyv)) in got.iter().zip(&xs).zip(&dys).enumerate() {
+        let expected = dyv * gelu_prime_ref(x);
         assert!((g - expected).abs() <= 1e-5, "index {index}: got {g} expected {expected}");
     }
 }
 
 #[cfg(feature = "cuda")]
 fn erf_ref(x: f32) -> f32 {
+    // Abramowitz and Stegun 7.1.26, same f32 spellings as the CPU backend.
+    const ERF_A1: f32 = 0.254_829_6;
+    const ERF_A2: f32 = 0.284_496_72;
+    const ERF_A3: f32 = 1.421_413_8;
+    const ERF_A4: f32 = 1.453_152_1;
+    const ERF_A5: f32 = 1.061_405_4;
     let sign = if x.is_sign_negative() { -1.0 } else { 1.0 };
     let x = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
-        + 0.254829592)
-        * t;
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let poly = (((((ERF_A5 * t - ERF_A4) * t) + ERF_A3) * t - ERF_A2) * t + ERF_A1) * t;
     sign * (1.0 - poly * (-x * x).exp())
 }
 
 #[cfg(feature = "cuda")]
 fn gelu_prime_ref(x: f32) -> f32 {
+    const INV_SQRT_2PI: f32 = 0.398_942_3;
     let phi = 0.5 * (1.0 + erf_ref(x * std::f32::consts::FRAC_1_SQRT_2));
-    let pdf = (-0.5 * x * x).exp() * 0.3989423;
+    let pdf = (-0.5 * x * x).exp() * INV_SQRT_2PI;
     phi + x * pdf
 }
 
