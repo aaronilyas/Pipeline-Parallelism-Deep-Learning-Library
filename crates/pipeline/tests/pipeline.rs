@@ -256,7 +256,7 @@ fn run_rank<T: Transport>(transport: T, stages: usize, order: &[usize]) -> RankR
     };
     let weight_ids_before = weights.iter().map(|w| w.storage.storage_id()).collect();
 
-    let out = train(&backend, &mut transport, &placement, &weights, &inputs, &dy)
+    let out = train(&backend, &mut transport, &placement, order.len(), &weights, &inputs, &dy)
         .expect("train succeeds");
 
     RankResult {
@@ -596,4 +596,29 @@ fn counting_wrapper_logs_each_success_once() {
     assert_eq!(backend.entries(), vec!["upload", "upload", "alloc", "gemm", "download"]);
     assert_eq!(backend.count("gemm"), 1);
     assert_eq!(c.strides, row_major_strides(&[1, 1]));
+}
+
+#[test]
+fn microbatch_count_must_match_inputs_and_dy() {
+    // Amendment: every rank is told M. Rank 0 needs inputs.len() == M and the
+    // last rank needs dy.len() == M; M == 0 is rejected.
+    let cpu = CpuBackend::new();
+    let placement = Placement { owners: vec![0, 0, 0] };
+    let weights: Vec<_> = (0..LAYERS)
+        .map(|l| {
+            cpu.upload(DType::F32, &[WIDTHS[l], WIDTHS[l + 1]], &bytes_of(&weight(l))).unwrap()
+        })
+        .collect();
+    let x = |v: &[f32]| cpu.upload(DType::F32, &[BATCH, WIDTHS[0]], &bytes_of(v)).unwrap();
+    let d = |v: &[f32]| cpu.upload(DType::F32, &[BATCH, WIDTHS[LAYERS]], &bytes_of(v)).unwrap();
+    let inputs = vec![x(&X0), x(&X1)];
+    let dy = vec![d(&DY0), d(&DY1)];
+    let run = |m: usize, inputs: &[Tensor<_>], dy: &[Tensor<_>]| {
+        train(&cpu, &mut Solo, &placement, m, &weights, inputs, dy).map(|_| ())
+    };
+    assert_eq!(run(3, &inputs, &dy), Err(Error::Schedule), "M above inputs");
+    assert_eq!(run(1, &inputs, &dy), Err(Error::Schedule), "M below inputs");
+    assert_eq!(run(2, &inputs, &dy[..1]), Err(Error::Schedule), "dy short");
+    assert_eq!(run(0, &[], &[]), Err(Error::Schedule), "M zero");
+    assert_eq!(run(2, &inputs, &dy), Ok(()), "matching M");
 }

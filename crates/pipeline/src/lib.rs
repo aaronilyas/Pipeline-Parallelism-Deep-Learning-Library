@@ -1,6 +1,9 @@
 //! Pipeline-parallel training of a stack of `gelu(x @ W)` layers.
 //!
 //! RED stubs: the public API compiles and returns well-formed but wrong values.
+//!
+//! Every rank is told the microbatch count: a middle rank receives neither
+//! inputs nor dy, so it cannot infer it.
 
 use linalg_core::{Backend, Error, Tensor, Transport};
 
@@ -24,10 +27,11 @@ pub fn train<B: Backend, T: Transport>(
     backend: &B,
     transport: &mut T,
     placement: &Placement,
+    microbatches: usize,
     weights: &[Tensor<B::Store>],
     inputs: &[Tensor<B::Store>],
     dy: &[Tensor<B::Store>],
 ) -> Result<TrainOutput<B::Store>, Error> {
-    let _ = (backend, transport, placement, weights, inputs, dy);
+    let _ = (backend, transport, placement, microbatches, weights, inputs, dy);
     Ok(TrainOutput { y: Vec::new(), dw: Vec::new() })
 }
