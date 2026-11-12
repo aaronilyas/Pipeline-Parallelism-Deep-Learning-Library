@@ -48,9 +48,20 @@ fn ref_argmax(x: &[f32]) -> usize {
     ref_best(x.iter().map(|v| v.abs()))
 }
 
+/// A complex part as the kernel sees it: parts below the smallest normal count as zero,
+/// because Apple GPUs may flush subnormals and the contract must not depend on that.
+fn part(v: f32) -> f32 {
+    let a = v.abs();
+    if a < f32::MIN_POSITIVE {
+        0.0
+    } else {
+        a
+    }
+}
+
 /// The `f32` complex magnitude formulas shared with the kernel.
 fn mag32(z: [f32; 2], kind: Magnitude) -> f32 {
-    let (re, im) = (z[0].abs(), z[1].abs());
+    let (re, im) = (part(z[0]), part(z[1]));
     if re.is_nan() || im.is_nan() {
         return f32::NAN;
     }
@@ -99,7 +110,13 @@ fn assert_within_one_ulp(x: &[[f32; 2]], kind: Magnitude, got: usize) {
     }
     let (want, have) = (true_max as f32, picked as f32);
     let distance = i64::from(want.to_bits()).abs_diff(i64::from(have.to_bits()));
-    assert!(distance <= 1, "magnitude {have:e} is {distance} ULP from true max {want:e}");
+    // Parts below the smallest normal are treated as zero, which can shift a magnitude by
+    // less than one smallest-normal; that slack is the only allowance beyond 1 ULP.
+    let flushed = (f64::from(want) - f64::from(have)).abs() <= f64::from(f32::MIN_POSITIVE);
+    assert!(
+        distance <= 1 || flushed,
+        "magnitude {have:e} is {distance} ULP from true max {want:e}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -290,7 +307,7 @@ fn ten_million_elements() {
     let n = 10_000_000;
     let mut x = random_f32(&mut r, n);
     check(&c, &x, "random 1e7");
-    x.iter_mut().for_each(|v| *v = v.clamp(-10.0, 10.0));
+    x.iter_mut().for_each(|v| *v /= 1000.0);
     x[n - 1] = 10.0;
     x[n / 2] = -10.0;
     x[777] = -10.0;
@@ -565,7 +582,7 @@ fn complex_magnitudes_near_f32_max_do_not_overflow_in_hypot() {
     for n in [2usize, 33, TG + 1, SINGLE_PASS_MAX_LEN + 1, 5 * SINGLE_PASS_MAX_LEN + 3] {
         // Naive sqrt(re² + im²) overflows for all of these; max-scaling must not.
         let mut x = vec![[0.6 * m, 0.6 * m]; n];
-        x[n - 1] = [0.7 * m, 0.1 * m];
+        x[n - 1] = [0.9 * m, 0.3 * m];
         check_complex(&c, &x, Magnitude::Hypot, "near MAX hypot");
         assert_eq!(gpu_argmax_complex(&c, &x, Magnitude::Hypot), n - 1, "n={n} hypot");
         // L1 stays finite while the sum fits.
@@ -591,9 +608,14 @@ fn complex_subnormal_and_mixed_scale_parts() {
     let c = ctx();
     let tiny = f32::from_bits(3);
     let x = vec![[tiny, 0.0], [0.0, 0.0], [0.0, tiny], [f32::from_bits(4), 0.0], [0.0, 0.0]];
+    let mut y = x.clone();
+    y[3] = [f32::MIN_POSITIVE, 0.0];
     for kind in [Magnitude::L1, Magnitude::Hypot] {
+        // Subnormal parts count as zero, so every element ties at 0 until a normal one appears.
         check_complex(&c, &x, kind, "subnormals");
-        assert_eq!(gpu_argmax_complex(&c, &x, kind), 3);
+        assert_eq!(gpu_argmax_complex(&c, &x, kind), 0, "{kind:?} subnormals are zero");
+        check_complex(&c, &y, kind, "smallest normal");
+        assert_eq!(gpu_argmax_complex(&c, &y, kind), 3, "{kind:?} smallest normal beats zero");
     }
     let mut r = rng(22);
     let wide: Vec<[f32; 2]> = (0..20_000)
