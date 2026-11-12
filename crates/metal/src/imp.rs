@@ -1,12 +1,40 @@
 //! macOS implementation: buffers are shared Metal buffers, f32 gemm delegates to the legacy
 //! `linalg` contraction kernel, and GELU runs two small kernels under `shaders/`.
+//!
+//! The backend's own code on the gemm, gelu and gelu_backward paths performs no atomic. Every
+//! metal-rs method goes through objc 0.2.7's `sel!`, which loads a per-call-site
+//! `static AtomicUsize` on each message. So buffer ids and lengths are read once at allocation,
+//! selectors are registered once in [`MetalBackend::new`], and [`MetalBackend::dispatch`] sends
+//! through `objc_msgSend` directly. The legacy gemm the spec requires is outside this rule.
+
+use std::ffi::c_void;
 
 use linalg::abi::{alloc_shared, LinalgError, MetalContext, TensorView};
 use linalg::ops::contraction::gemm as legacy_gemm;
 use linalg_core::{row_major_strides, Backend, DType, DeviceKind, Error, Identified, Tensor};
+use metal::foreign_types::{ForeignType, ForeignTypeRef};
+use metal::objc::runtime::{Object, Sel};
 use metal::{ComputePipelineState, MTLCommandBufferStatus, MTLSize};
 
 const GELU_SOURCE: &str = include_str!("../shaders/gelu.metal");
+
+#[link(name = "objc", kind = "dylib")]
+extern "C" {
+    /// The Objective-C message trampoline. Each use casts it to the message's exact C signature.
+    fn objc_msgSend();
+}
+
+type Id = *mut Object;
+
+/// `objc_msgSend` as the function-pointer type `F`, which must be the message's C signature
+/// (receiver, selector, then the arguments).
+///
+/// # Safety
+/// `F` must be an `unsafe extern "C" fn` type matching the method that will be sent.
+unsafe fn msg_send_fn<F: Copy>() -> F {
+    let trampoline: unsafe extern "C" fn() = objc_msgSend;
+    std::mem::transmute_copy(&trampoline)
+}
 
 /// One shared Metal buffer. `Clone` retains the buffer and copies nothing.
 ///
@@ -14,12 +42,53 @@ const GELU_SOURCE: &str = include_str!("../shaders/gelu.metal");
 #[derive(Clone)]
 pub struct MetalStore {
     pub(crate) buffer: metal::Buffer,
+    /// `buffer.contents()`, read once at allocation. A shared buffer's contents never move.
+    contents: u64,
+    /// `buffer.length()` in bytes, read once at allocation.
+    length: u64,
 }
 
 impl Identified for MetalStore {
     fn storage_id(&self) -> u64 {
-        self.buffer.contents() as u64
+        self.contents
     }
+}
+
+/// Every selector `dispatch` sends, registered once.
+struct Selectors {
+    command_buffer: Sel,
+    compute_command_encoder: Sel,
+    set_compute_pipeline_state: Sel,
+    set_buffer: Sel,
+    set_bytes: Sel,
+    dispatch_threads: Sel,
+    end_encoding: Sel,
+    commit: Sel,
+    wait_until_completed: Sel,
+    status: Sel,
+}
+
+impl Selectors {
+    fn register() -> Self {
+        Self {
+            command_buffer: Sel::register("commandBuffer"),
+            compute_command_encoder: Sel::register("computeCommandEncoder"),
+            set_compute_pipeline_state: Sel::register("setComputePipelineState:"),
+            set_buffer: Sel::register("setBuffer:offset:atIndex:"),
+            set_bytes: Sel::register("setBytes:length:atIndex:"),
+            dispatch_threads: Sel::register("dispatchThreads:threadsPerThreadgroup:"),
+            end_encoding: Sel::register("endEncoding"),
+            commit: Sel::register("commit"),
+            wait_until_completed: Sel::register("waitUntilCompleted"),
+            status: Sel::register("status"),
+        }
+    }
+}
+
+/// A GELU pipeline and its threadgroup width, read once.
+struct Kernel {
+    state: ComputePipelineState,
+    width: u64,
 }
 
 #[cfg(any(test, feature = "debug-counters"))]
@@ -33,8 +102,9 @@ struct Stats {
 
 pub struct MetalBackend {
     ctx: MetalContext,
-    gelu: ComputePipelineState,
-    gelu_backward: ComputePipelineState,
+    gelu: Kernel,
+    gelu_backward: Kernel,
+    sel: Selectors,
     #[cfg(any(test, feature = "debug-counters"))]
     stats: std::sync::Mutex<Stats>,
 }
@@ -48,12 +118,15 @@ impl MetalBackend {
             .device
             .new_library_with_source(GELU_SOURCE, &options)
             .map_err(|_| Error::UnsupportedDevice)?;
-        let pipeline = |name: &str| -> Result<ComputePipelineState, Error> {
+        let pipeline = |name: &str| -> Result<Kernel, Error> {
             let function =
                 library.get_function(name, None).map_err(|_| Error::UnsupportedDevice)?;
-            ctx.device
+            let state = ctx
+                .device
                 .new_compute_pipeline_state_with_function(&function)
-                .map_err(|_| Error::UnsupportedDevice)
+                .map_err(|_| Error::UnsupportedDevice)?;
+            let width = state.max_total_threads_per_threadgroup().min(256);
+            Ok(Kernel { state, width })
         };
         let gelu = pipeline("gelu_f32")?;
         let gelu_backward = pipeline("gelu_backward_f32")?;
@@ -61,6 +134,7 @@ impl MetalBackend {
             ctx,
             gelu,
             gelu_backward,
+            sel: Selectors::register(),
             #[cfg(any(test, feature = "debug-counters"))]
             stats: std::sync::Mutex::new(Stats::default()),
         })
@@ -97,8 +171,9 @@ impl MetalBackend {
     fn new_tensor(&self, dtype: DType, shape: &[usize]) -> Result<Tensor<MetalStore>, Error> {
         let bytes = nbytes(dtype, shape)?;
         let buffer = alloc_shared::<u8>(&self.ctx, bytes);
+        let (contents, length) = (buffer.contents() as u64, buffer.length());
         Ok(Tensor {
-            storage: MetalStore { buffer },
+            storage: MetalStore { buffer, contents, length },
             dtype,
             shape: shape.to_vec(),
             strides: row_major_strides(shape),
@@ -121,39 +196,60 @@ impl MetalBackend {
         }
         let count = numel(shape)?;
         let bytes = count.checked_mul(4).ok_or(Error::Shape)?;
-        if tensors.iter().any(|t| (t.storage.buffer.length() as usize) < bytes) {
+        if tensors.iter().any(|t| (t.storage.length as usize) < bytes) {
             return Err(Error::Shape);
         }
         u32::try_from(count).map_err(|_| Error::Shape)
     }
 
+    /// One compute dispatch of `kernel` over `count` threads with `buffers` at indices
+    /// `0..len` and `count` at index `len`; waits for completion. The same messages metal-rs
+    /// sends, through `objc_msgSend` with the selectors registered in `new`.
     fn dispatch(
         &self,
-        pipeline: &ComputePipelineState,
+        kernel: &Kernel,
         buffers: &[&metal::BufferRef],
         count: u32,
     ) -> Result<(), Error> {
-        let cmd = self.ctx.queue.new_command_buffer();
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pipeline);
-        for (index, buffer) in buffers.iter().enumerate() {
-            enc.set_buffer(index as u64, Some(buffer), 0);
-        }
-        enc.set_bytes(
-            buffers.len() as u64,
-            std::mem::size_of::<u32>() as u64,
-            (&count as *const u32).cast(),
-        );
-        let width = pipeline.max_total_threads_per_threadgroup().min(256);
-        enc.dispatch_threads(
-            MTLSize { width: u64::from(count), height: 1, depth: 1 },
-            MTLSize { width, height: 1, depth: 1 },
-        );
-        enc.end_encoding();
-        cmd.commit();
-        cmd.wait_until_completed();
-        if cmd.status() == MTLCommandBufferStatus::Error {
-            return Err(Error::UnsupportedDevice);
+        let sel = &self.sel;
+        // SAFETY: each cast matches the method's Objective-C signature (NSUInteger is u64 and
+        // MTLSize is #[repr(C)] on Apple Silicon). The queue, pipeline and buffers are live for
+        // the call; `commandBuffer` and `computeCommandEncoder` return autoreleased objects, as
+        // through metal-rs. `count` outlives `setBytes:`, which copies it.
+        unsafe {
+            let object: unsafe extern "C" fn(Id, Sel) -> Id = msg_send_fn();
+            let unit: unsafe extern "C" fn(Id, Sel) = msg_send_fn();
+            let set_state: unsafe extern "C" fn(Id, Sel, Id) = msg_send_fn();
+            let set_buffer: unsafe extern "C" fn(Id, Sel, Id, u64, u64) = msg_send_fn();
+            let set_bytes: unsafe extern "C" fn(Id, Sel, *const c_void, u64, u64) = msg_send_fn();
+            let dispatch: unsafe extern "C" fn(Id, Sel, MTLSize, MTLSize) = msg_send_fn();
+            let status: unsafe extern "C" fn(Id, Sel) -> u64 = msg_send_fn();
+
+            let cmd = object(self.ctx.queue.as_ptr().cast(), sel.command_buffer);
+            let enc = object(cmd, sel.compute_command_encoder);
+            set_state(enc, sel.set_compute_pipeline_state, kernel.state.as_ptr().cast());
+            for (index, buffer) in buffers.iter().enumerate() {
+                set_buffer(enc, sel.set_buffer, buffer.as_ptr().cast(), 0, index as u64);
+            }
+            set_bytes(
+                enc,
+                sel.set_bytes,
+                (&count as *const u32).cast(),
+                std::mem::size_of::<u32>() as u64,
+                buffers.len() as u64,
+            );
+            dispatch(
+                enc,
+                sel.dispatch_threads,
+                MTLSize { width: u64::from(count), height: 1, depth: 1 },
+                MTLSize { width: kernel.width, height: 1, depth: 1 },
+            );
+            unit(enc, sel.end_encoding);
+            unit(cmd, sel.commit);
+            unit(cmd, sel.wait_until_completed);
+            if status(cmd, sel.status) == MTLCommandBufferStatus::Error as u64 {
+                return Err(Error::UnsupportedDevice);
+            }
         }
         Ok(())
     }
@@ -187,8 +283,16 @@ fn map_legacy(err: LinalgError) -> Error {
     }
 }
 
+/// The legacy view of `t`, built from the cached contents address (`TensorView::new` would
+/// message the buffer for it).
 fn view<'a>(t: &'a Tensor<MetalStore>) -> TensorView<'a, f32> {
-    TensorView::new(&t.storage.buffer, 0, t.shape.clone(), t.strides.clone())
+    TensorView {
+        buffer: &t.storage.buffer,
+        host_ptr: t.storage.contents as usize as *mut f32,
+        offset: 0,
+        shape: t.shape.clone(),
+        strides: t.strides.clone(),
+    }
 }
 
 fn numel(shape: &[usize]) -> Result<usize, Error> {
