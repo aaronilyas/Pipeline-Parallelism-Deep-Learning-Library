@@ -677,10 +677,11 @@ fn rejects_invalid_metadata_without_launching() {
     assert!(invalid(adjoint(&ctx, &src, &strided)));
     let padded = TensorView::<f32>::new(&dst_buf, 0, vec![32, 16], vec![20, 1]);
     assert!(invalid(adjoint(&ctx, &src, &padded)));
-    // Destination or source outside its buffer.
-    let too_far = TensorView::<f32>::row_major(&dst_buf, 1024 - 100, vec![32, 16]);
+    // Destination or source outside its buffer (allocations round up to whole granules).
+    let capacity = dst_buf.length() as usize / size_of::<f32>();
+    let too_far = TensorView::<f32>::row_major(&dst_buf, capacity - 100, vec![32, 16]);
     assert!(invalid(adjoint(&ctx, &src, &too_far)));
-    let src_too_far = TensorView::<f32>::row_major(&src_buf, 1024 - 100, vec![16, 32]);
+    let src_too_far = TensorView::<f32>::row_major(&src_buf, capacity - 100, vec![16, 32]);
     let ok_dst = TensorView::<f32>::row_major(&dst_buf, 0, vec![32, 16]);
     assert!(invalid(adjoint(&ctx, &src_too_far, &ok_dst)));
     // Rank / stride-count mismatches and rank < 2 for the adjoint.
