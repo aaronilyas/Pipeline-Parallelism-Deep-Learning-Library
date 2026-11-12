@@ -5,8 +5,9 @@
 //   2. otherwise the larger magnitude wins;
 //   3. equal magnitudes (-0 vs +0, equal infinities, +x vs -x) go to the lowest index.
 // Magnitudes are compared as integer keys (the IEEE bit pattern of a non-negative float orders
-// like its value, and every NaN maps to one key above +inf), so subnormals are never flushed
-// by float compares. The order is total on (key, index) pairs and indices are unique, so the
+// like its value, and every NaN maps to one key above +inf). Complex |re| and |im| are reduced
+// to that key with integer scaling, so a subnormal part is not flushed before the f32 formula.
+// The order is total on (key, index) pairs and indices are unique, so the
 // winner does not depend on the order in which candidates are combined: results are bitwise
 // deterministic and no atomics are needed.
 //
@@ -23,9 +24,6 @@ constant constexpr uint kThreadgroupSize = 256;
 constant constexpr uint kMaxSimdGroups = 32;
 // Key shared by every NaN: above the key of +inf (0x7f800000).
 constant constexpr uint kNanKey = 0x7fc00000u;
-// Smallest positive normal f32; complex parts below it count as zero.
-constant constexpr float kMinNormal = 1.17549435e-38f;
-
 // Launch parameters; mirrors `Params` in src/ops/argmax.rs field for field.
 struct Params {
     ulong offset;      // element offset of the first input element
@@ -55,35 +53,154 @@ struct RealMagnitude {
     static uint key(float v) { return key_of(v); }
 };
 
-// A complex part for magnitude arithmetic: |p|, with parts below the smallest normal
-// (subnormals, which the GPU may flush) counted as zero so results do not depend on flushing.
-inline float part(float p) {
-    const float a = fabs(p);
-    return (a >= kMinNormal || isnan(a)) ? a : 0.0f;
+// Sign-stripped IEEE bits. For a non-negative finite value these bits are its magnitude key.
+inline uint abs_bits(float p) { return as_type<uint>(p) & 0x7fffffffu; }
+
+inline uint clz_ulong(ulong x) {
+    const uint hi = uint(x >> 32);
+    return hi != 0u ? clz(hi) : 32u + clz(uint(x));
+}
+
+// Correctly rounded key of `prod * 2^binary_exp`. `prod` is nonzero.
+// Normal results take one round-to-nearest-even of the 24-bit significand. Subnormal
+// results round `prod * 2^(binary_exp + 149)` onto the 2^-149 grid. No float arithmetic,
+// so flush-to-zero cannot change the bits.
+inline uint round_scaled_int(ulong prod, int binary_exp) {
+    const uint p = 63u - clz_ulong(prod);
+    int biased = int(p) + binary_exp + 127;
+    if (biased >= 255) return 0x7f800000u;
+    if (p >= 23u && biased >= 1) {
+        const uint shift = p - 23u;
+        ulong sig = prod >> shift;
+        if (shift > 0u) {
+            const ulong mid = ulong(1) << (shift - 1u);
+            const ulong rem = prod & ((mid << 1u) - 1ul);
+            if (rem > mid || (rem == mid && (sig & 1ul) != 0ul)) {
+                sig += 1ul;
+                if (sig == 0x1000000ul) {
+                    sig >>= 1u;
+                    biased += 1;
+                    if (biased >= 255) return 0x7f800000u;
+                }
+            }
+        }
+        if (biased >= 1) return (uint(biased) << 23) | uint(sig & 0x7ffffful);
+    }
+    // Subnormal or zero: integer number of 2^-149 units.
+    const int q = binary_exp + 149;
+    if (q >= 63) return 0x7f800000u;
+    if (q >= 0) {
+        const ulong lifted = prod << uint(q);
+        return lifted >= 0x800000ul ? 0x00800000u : uint(lifted);
+    }
+    const uint right = uint(-q);
+    if (right >= 64u) return 0u;
+    ulong main = prod >> right;
+    const ulong mid = ulong(1) << (right - 1u);
+    const ulong rem = prod & ((mid << 1u) - 1ul);
+    if (rem > mid || (rem == mid && (main & 1ul) != 0ul)) main += 1ul;
+    if (main >= 0x800000ul) return 0x00800000u | uint(main - 0x800000ul);
+    return uint(main);
+}
+
+// `s * m * 2^pow2`, with `s` a finite positive normal and `m` a 24-bit integer.
+inline uint scale_f32_u24(float s, uint m, int pow2) {
+    const uint bits = as_type<uint>(s);
+    const uint exp = bits >> 23;
+    const ulong sig = ulong(0x800000u | (bits & 0x7fffffu));
+    return round_scaled_int(sig * ulong(m), int(exp) - 150 + pow2);
+}
+
+// Subtract `delta` from the biased exponent of a positive normal. The callers that use
+// this only do so when the result stays normal, so the significand does not round again.
+inline uint exp_delta(float v, int delta) {
+    const uint bits = as_type<uint>(v);
+    const int exp = int(bits >> 23) + delta;
+    if (exp >= 255) return 0x7f800000u;
+    if (exp >= 1) return (uint(exp) << 23) | (bits & 0x7fffffu);
+    const uint sig = 0x800000u | (bits & 0x7fffffu);
+    return round_scaled_int(ulong(sig), int(bits >> 23) - 150 + delta);
+}
+
+// `m * 2^-126` for a subnormal field `m` in 1 .. 2^23-1. That is the subnormal times 2^23,
+// and it is a normal, built without a floating multiply.
+inline float subnormal_times_2_to_23(uint m) {
+    const uint p = 31u - clz(m);
+    const uint sig = m << (23u - p);
+    return as_type<float>(((p + 1u) << 23) | (sig & 0x7fffffu));
+}
+
+inline float scale_normal(uint bits, int delta) {
+    const int exp = int(bits >> 23) + delta;
+    return as_type<float>((uint(exp) << 23) | (bits & 0x7fffffu));
+}
+
+// |re| + |im| in f32. Subnormal parts are summed in integer units of 2^-149, which is
+// exact: two subnormal fields add to the IEEE bits of their sum (a subnormal, or the
+// normal just above the smallest normal). A subnormal added to a normal uses those same
+// units when it can reach half an ulp, and is ignored when it cannot.
+inline uint l1_key(uint a, uint b) {
+    if (a > 0x7f800000u || b > 0x7f800000u) return kNanKey;
+    if (a == 0x7f800000u || b == 0x7f800000u) return 0x7f800000u;
+    if (a < b) {
+        const uint swap = a;
+        a = b;
+        b = swap;
+    }
+    if (a < 0x00800000u) return a + b;
+    if (b == 0u || b >= 0x00800000u) return key_of(as_type<float>(a) + as_type<float>(b));
+    const uint exp = a >> 23;
+    // At biased exp 25 and above, a subnormal is strictly under half an ulp of `a`.
+    if (exp >= 25u) return a;
+    const ulong sig = ulong(0x800000u | (a & 0x7fffffu));
+    return round_scaled_int((sig << (exp - 1u)) + ulong(b), -149);
+}
+
+// max·sqrt(1+(min/max)^2) in f32. A subnormal input is scaled into the normal range by
+// an exact power of two, the f32 formula runs there, and the power is removed by an
+// integer exponent adjustment so the rounding matches IEEE and not flush-to-zero.
+inline uint hypot_key(uint a, uint b) {
+    if (a > 0x7f800000u || b > 0x7f800000u) return kNanKey;
+    if (a == 0x7f800000u || b == 0x7f800000u) return 0x7f800000u;
+    if (a < b) {
+        const uint swap = a;
+        a = b;
+        b = swap;
+    }
+    if (b == 0u) return a;
+    if (a >= 0x00800000u && b >= 0x00800000u) {
+        const float hi = as_type<float>(a);
+        const float lo = as_type<float>(b);
+        const float r = precise::divide(lo, hi);
+        return key_of(hi * precise::sqrt(fma(r, r, 1.0f)));
+    }
+    if (a < 0x00800000u) {
+        const float r = precise::divide(float(b), float(a));
+        const float root = precise::sqrt(fma(r, r, 1.0f));
+        return scale_f32_u24(root, a, -149);
+    }
+    // `a` is normal and `b` is subnormal. Once `a` reaches 2^-114, `b/a < 2^-12`,
+    // so `(b/a)^2` is strictly below half an ulp of 1 and the hypot is `a`.
+    if ((a >> 23) >= 13u) return a;
+    const float hi = scale_normal(a, 23);
+    const float lo = subnormal_times_2_to_23(b);
+    const float r = precise::divide(lo, hi);
+    const float scaled = hi * precise::sqrt(fma(r, r, 1.0f));
+    return exp_delta(scaled, -23);
 }
 
 // L1 magnitude of a complex element: |re| + |im| in f32 (NaN if either part is NaN,
 // +inf on overflow).
 struct ComplexL1 {
     using Element = float2;
-    static uint key(float2 z) { return key_of(part(z.x) + part(z.y)); }
+    static uint key(float2 z) { return l1_key(abs_bits(z.x), abs_bits(z.y)); }
 };
 
 // Overflow-safe complex modulus: hi * sqrt(1 + (lo / hi)^2) with hi = max(|re|, |im|).
 // NaN if either part is NaN; +inf if either part is infinite; 0 if both parts are zero.
 struct ComplexHypot {
     using Element = float2;
-    static uint key(float2 z) {
-        const float re = part(z.x);
-        const float im = part(z.y);
-        if (isnan(re) || isnan(im)) return kNanKey;
-        const float hi = max(re, im);
-        const float lo = min(re, im);
-        if (hi == 0.0f) return 0u;
-        if (isinf(hi)) return as_type<uint>(INFINITY);
-        const float r = precise::divide(lo, hi);
-        return key_of(hi * precise::sqrt(fma(r, r, 1.0f)));
-    }
+    static uint key(float2 z) { return hypot_key(abs_bits(z.x), abs_bits(z.y)); }
 };
 
 // Grid-stride serial accumulation over elements start, start + step, ... of the view.

@@ -48,20 +48,10 @@ fn ref_argmax(x: &[f32]) -> usize {
     ref_best(x.iter().map(|v| v.abs()))
 }
 
-/// A complex part as the kernel sees it: parts below the smallest normal count as zero,
-/// because Apple GPUs may flush subnormals and the contract must not depend on that.
-fn part(v: f32) -> f32 {
-    let a = v.abs();
-    if a < f32::MIN_POSITIVE {
-        0.0
-    } else {
-        a
-    }
-}
-
-/// The `f32` complex magnitude formulas shared with the kernel.
+/// The `f32` complex magnitude formulas shared with the kernel. Subnormals participate;
+/// the host arithmetic is IEEE, and the kernel matches it without flush-to-zero.
 fn mag32(z: [f32; 2], kind: Magnitude) -> f32 {
-    let (re, im) = (part(z[0]), part(z[1]));
+    let (re, im) = (z[0].abs(), z[1].abs());
     if re.is_nan() || im.is_nan() {
         return f32::NAN;
     }
@@ -110,13 +100,7 @@ fn assert_within_one_ulp(x: &[[f32; 2]], kind: Magnitude, got: usize) {
     }
     let (want, have) = (true_max as f32, picked as f32);
     let distance = i64::from(want.to_bits()).abs_diff(i64::from(have.to_bits()));
-    // Parts below the smallest normal are treated as zero, which can shift a magnitude by
-    // less than one smallest-normal; that slack is the only allowance beyond 1 ULP.
-    let flushed = (f64::from(want) - f64::from(have)).abs() <= f64::from(f32::MIN_POSITIVE);
-    assert!(
-        distance <= 1 || flushed,
-        "magnitude {have:e} is {distance} ULP from true max {want:e}"
-    );
+    assert!(distance <= 1, "magnitude {have:e} is {distance} ULP from true max {want:e}");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -604,23 +588,66 @@ fn complex_l1_overflow_saturates_and_ties_to_lowest_index() {
 }
 
 #[test]
-fn complex_subnormal_and_mixed_scale_parts() {
+fn complex_subnormal_parts_keep_their_magnitude() {
     let c = ctx();
+    let t = f32::from_bits(1);
+    // The failing adversarial case: |t| + |t| beats a single subnormal part, and a true
+    // zero must not win.
+    let mut pair = vec![[0.0f32, 0.0]; 6];
+    pair[3] = [0.0, -t];
+    pair[5] = [t, t];
+    check_complex(&c, &pair, Magnitude::L1, "one-bit subnormal l1");
+    assert_eq!(gpu_argmax_complex(&c, &pair, Magnitude::L1), 5);
+    check_complex(&c, &pair, Magnitude::Hypot, "one-bit subnormal hypot");
+
+    // Two largest subnormals sum to the normal 0x00fffffe, above the smallest normal.
+    let s = f32::from_bits(0x007f_ffff);
+    let summed = vec![[f32::MIN_POSITIVE, 0.0], [s, s]];
+    check_complex(&c, &summed, Magnitude::L1, "subnormal sum beats min normal");
+    assert_eq!(gpu_argmax_complex(&c, &summed, Magnitude::L1), 1);
+    check_complex(&c, &summed, Magnitude::Hypot, "subnormal hypot beats min normal");
+
     let tiny = f32::from_bits(3);
-    let x = vec![[tiny, 0.0], [0.0, 0.0], [0.0, tiny], [f32::from_bits(4), 0.0], [0.0, 0.0]];
-    let mut y = x.clone();
-    y[3] = [f32::MIN_POSITIVE, 0.0];
+    let small = vec![[tiny, 0.0], [0.0, 0.0], [0.0, tiny], [f32::from_bits(4), 0.0], [0.0, 0.0]];
     for kind in [Magnitude::L1, Magnitude::Hypot] {
-        // Subnormal parts count as zero, so every element ties at 0 until a normal one appears.
-        check_complex(&c, &x, kind, "subnormals");
-        assert_eq!(gpu_argmax_complex(&c, &x, kind), 0, "{kind:?} subnormals are zero");
-        check_complex(&c, &y, kind, "smallest normal");
-        assert_eq!(gpu_argmax_complex(&c, &y, kind), 3, "{kind:?} smallest normal beats zero");
+        check_complex(&c, &small, kind, "largest tiny subnormal");
+        assert_eq!(gpu_argmax_complex(&c, &small, kind), 3, "{kind:?}");
     }
+
+    // Half-ulp boundary: biased exp 24 has ulp 2^-126, and a subnormal of 2^22 units
+    // is exactly half an ulp (tie stays), while one unit more rounds up.
+    let n = f32::from_bits(24 << 23);
+    let tie = vec![[n, 0.0], [n, f32::from_bits(1 << 22)]];
+    let up = vec![[n, 0.0], [n, f32::from_bits((1 << 22) + 1)]];
+    check_complex(&c, &tie, Magnitude::L1, "half ulp tie");
+    assert_eq!(gpu_argmax_complex(&c, &tie, Magnitude::L1), 0);
+    check_complex(&c, &up, Magnitude::L1, "half ulp rounds up");
+    assert_eq!(gpu_argmax_complex(&c, &up, Magnitude::L1), 1);
+
+    let mut fields = Vec::new();
+    for bits in [1u32, 2, 3, 0x10, 0x7f, 0x80, 0xff, 0x400000, 0x7fffff] {
+        let p = f32::from_bits(bits);
+        fields.push([p, 0.0]);
+        fields.push([0.0, -p]);
+        fields.push([p, p]);
+        fields.push([-p, f32::from_bits(bits / 2)]);
+    }
+    for exp in [1u32, 2, 8, 12, 13, 24, 25, 127] {
+        let n = f32::from_bits(exp << 23);
+        fields.push([n, f32::from_bits(1)]);
+        fields.push([n, f32::from_bits(0x7f_ffff)]);
+        fields.push([n * 0.75, f32::from_bits(0x40_0000)]);
+    }
+    for (i, z) in fields.iter().copied().enumerate() {
+        let against_zero = vec![[0.0, 0.0], z];
+        check_complex(&c, &against_zero, Magnitude::L1, &format!("l1 field {i}"));
+        check_complex(&c, &against_zero, Magnitude::Hypot, &format!("hypot field {i}"));
+    }
+
     let mut r = rng(22);
     let wide: Vec<[f32; 2]> = (0..20_000)
         .map(|_| {
-            let e = |r: &mut ChaCha8Rng| 2f32.powi(r.random_range(-60..60));
+            let e = |r: &mut ChaCha8Rng| 2f32.powi(r.random_range(-149..60));
             [e(&mut r) * r.random_range(-1.0f32..1.0), e(&mut r) * r.random_range(-1.0f32..1.0)]
         })
         .collect();

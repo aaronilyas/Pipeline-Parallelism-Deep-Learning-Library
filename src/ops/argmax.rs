@@ -55,8 +55,10 @@ const SOURCE: &str = include_str!("../../shaders/argmax.metal");
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Magnitude {
     /// `|re| + |im|`, computed in `f32` (saturates to `+inf` on overflow).
+    /// Subnormal parts are included; they are not flushed to zero.
     L1,
     /// `max · sqrt(1 + (min/max)²)` with `max = max(|re|, |im|)`, computed in `f32`.
+    /// Subnormal parts are included; they are not flushed to zero.
     Hypot,
 }
 
