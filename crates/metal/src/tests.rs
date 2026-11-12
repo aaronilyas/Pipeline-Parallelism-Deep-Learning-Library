@@ -19,6 +19,79 @@ fn cargo_toml_has_no_linalg_cpu_dependency() {
     assert!(!text.contains("linalg_cpu"), "metal must not depend on linalg-cpu");
 }
 
+/// gemm, gelu and gelu_backward perform no atomic of their own. Every metal-rs method (and
+/// every `msg_send!`/`sel!` in this crate) expands objc 0.2.7's `sel_impl!`, which keeps the
+/// selector in a `static AtomicUsize` and loads it on each message (objc-0.2.7/src/macros.rs).
+/// So the backend's own code on these paths must send no message through that machinery:
+/// selectors are registered once in `new`, and ids and lengths are cached at allocation. The
+/// one legacy `gemm` call is exempt; the spec requires it. Reads the source, so it runs on
+/// every OS.
+#[test]
+fn compute_paths_send_no_selector_cached_messages() {
+    const PATHS: [&str; 7] = [
+        "fn storage_id(",
+        "fn elementwise_count(",
+        "fn dispatch(",
+        "fn view<",
+        "fn gemm(",
+        "fn gelu(",
+        "fn gelu_backward(",
+    ];
+    const MESSAGES: [&str; 16] = [
+        ".contents()",
+        ".length()",
+        ".new_command_buffer(",
+        ".new_compute_command_encoder(",
+        ".set_compute_pipeline_state(",
+        ".set_buffer(",
+        ".set_bytes(",
+        ".max_total_threads_per_threadgroup(",
+        ".dispatch_threads(",
+        ".end_encoding(",
+        ".commit(",
+        ".wait_until_completed(",
+        ".status(",
+        "msg_send!",
+        "sel!",
+        "TensorView::new(",
+    ];
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/imp.rs");
+    let source = std::fs::read_to_string(path).expect("read imp.rs");
+    // Line comments removed, so prose may name the methods.
+    let code: String = source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut hits = Vec::new();
+    for name in PATHS {
+        let start = code.find(name).unwrap_or_else(|| panic!("imp.rs has no `{name}`"));
+        let open = start + code[start..].find('{').expect("function body");
+        let mut depth = 0;
+        let mut end = open;
+        for (i, c) in code[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &code[open..=end];
+        for message in MESSAGES {
+            if body.contains(message) {
+                hits.push(format!("`{name}..` sends `{message}`"));
+            }
+        }
+    }
+    assert!(hits.is_empty(), "selector-cached messages on the compute paths:\n{}", hits.join("\n"));
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
 
