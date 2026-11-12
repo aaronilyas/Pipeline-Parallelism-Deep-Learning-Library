@@ -4,7 +4,6 @@
 //! Test builds record counters. Release builds of those three functions take no
 //! mutex and perform no atomic.
 
-use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use half::{bf16, f16};
@@ -13,26 +12,53 @@ use linalg_core::{row_major_strides, Backend, DType, DeviceKind, Error, Identifi
 /// Owns one byte buffer. The id is the address of this allocation, not the data
 /// pointer: a zero-length buffer has no unique data address, and [`Clone`] only
 /// bumps the refcount.
+///
+/// The data pointer and length are captured once at construction. `len` and
+/// `as_mut_ptr` copy those fields. Neither forms a `&mut Vec<u8>` or a
+/// `&mut [u8]` from `&self`.
 struct Allocation {
-    bytes: UnsafeCell<Vec<u8>>,
+    ptr: *mut u8,
+    len: usize,
 }
 
-// `Backend` is `Sync`. The math path does not lock. Callers must not race one id.
+// SAFETY: `ptr` and `len` uniquely own one `Box<[u8]>` (an empty box keeps its
+// dangling pointer). Moving `Allocation` moves that owner. No method on
+// `&Allocation` forms a reference to the bytes, so a move does not invalidate
+// an outstanding alias.
 unsafe impl Send for Allocation {}
+
+// SAFETY: `&Allocation` only copies the captured pointer and length. Byte reads
+// and writes go through that pointer, not through a reference held by this
+// type. Sharing is sound because no thread may read or write a storage id while
+// another call writes that same storage id.
 unsafe impl Sync for Allocation {}
 
 impl Allocation {
     fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes: UnsafeCell::new(bytes) }
+        let boxed = bytes.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = Box::into_raw(boxed).cast::<u8>();
+        Self { ptr, len }
     }
 
     fn len(&self) -> usize {
-        unsafe { (*self.bytes.get()).len() }
+        self.len
     }
 
-    /// The buffer is never reallocated, so this pointer stays valid for the call.
+    /// Captured at construction. The buffer is never reallocated, so the pointer
+    /// stays valid for the life of this allocation.
     fn as_mut_ptr(&self) -> *mut u8 {
-        unsafe { (*self.bytes.get()).as_mut_ptr() }
+        self.ptr
+    }
+}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` and `len` came from `Box::<[u8]>::into_raw` and this
+        // drop is the unique owner of that box.
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr, self.len)));
+        }
     }
 }
 
@@ -115,6 +141,12 @@ impl CpuBackend {
         {
             let _ = name;
         }
+    }
+}
+
+impl Default for CpuBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -418,6 +450,7 @@ fn indexer(tensor: &Tensor<CpuStore>) -> impl Fn(usize, usize) -> usize {
     move |row, col| offset + row * stride_row + col * stride_col
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accumulate<A, B, C, W>(
     m: usize,
     n: usize,
@@ -511,9 +544,7 @@ fn erf_f32(x: f32) -> f32 {
     let sign = if x.is_sign_negative() { -1.0 } else { 1.0 };
     let x = x.abs();
     let t = 1.0 / (1.0 + 0.3275911 * x);
-    let poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
-        + 0.254829592)
-        * t;
+    let poly = (((((ERF_A5 * t - ERF_A4) * t) + ERF_A3) * t - ERF_A2) * t + ERF_A1) * t;
     sign * (1.0 - poly * (-x * x).exp())
 }
 
@@ -528,7 +559,30 @@ fn gelu_prime_f32(x: f32) -> f32 {
     phi + x * pdf
 }
 
-const INV_SQRT_2PI: f32 = 0.3989422804014327;
+// `f32` spellings of 0.254829592, 0.284496736, 1.421413741, 1.453152027,
+// 1.061405429, and 0.3989422804014327. Assertions pin those `to_bits` values.
+const ERF_A1: f32 = 0.254_829_6;
+const ERF_A2: f32 = 0.284_496_72;
+const ERF_A3: f32 = 1.421_413_8;
+const ERF_A4: f32 = 1.453_152_1;
+const ERF_A5: f32 = 1.061_405_4;
+const INV_SQRT_2PI: f32 = 0.398_942_3;
+
+/// `f32::to_bits` is not `const` on the 1.82 MSRV.
+#[allow(unnecessary_transmutes)]
+const fn f32_bits(value: f32) -> u32 {
+    // SAFETY: `f32` and `u32` have the same size and alignment.
+    unsafe { std::mem::transmute::<f32, u32>(value) }
+}
+
+const _: () = {
+    assert!(f32_bits(ERF_A1) == 0x3e82_7906);
+    assert!(f32_bits(ERF_A2) == 0x3e91_a98e);
+    assert!(f32_bits(ERF_A3) == 0x3fb5_f0e3);
+    assert!(f32_bits(ERF_A4) == 0x3fba_00e3);
+    assert!(f32_bits(ERF_A5) == 0x3f87_dc22);
+    assert!(f32_bits(INV_SQRT_2PI) == 0x3ecc_422a);
+};
 
 #[cfg(test)]
 mod invariants;

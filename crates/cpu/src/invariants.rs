@@ -34,6 +34,7 @@ fn narrow_bytes(values: &[f32], bits_of: impl Fn(f32) -> u16) -> Vec<u8> {
 
 /// Spec accumulation: `acc` starts at 0 when `beta` is 0, otherwise at `beta * C`,
 /// then `acc += alpha * A * B` in `k` order. Products associate left.
+#[allow(clippy::too_many_arguments)]
 fn sequential(
     m: usize,
     n: usize,
@@ -94,6 +95,7 @@ fn transposed(
     view
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gemm_layouts(
     a: &[f32],
     b: &[f32],

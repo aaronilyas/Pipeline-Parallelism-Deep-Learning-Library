@@ -64,6 +64,10 @@ pub trait Identified {
     fn storage_id(&self) -> u64;
 }
 
+/// One device's execution of the tensor contract.
+///
+/// No thread may read or write a `storage_id` while another call writes that
+/// same `storage_id`.
 pub trait Backend: Send + Sync {
     type Store: Clone + Send + Sync + Identified;
 
@@ -203,20 +207,18 @@ pub fn decode_wire(bytes: &[u8]) -> Result<(DType, Vec<usize>, Vec<u8>), Error> 
     if bytes.len() < header {
         return Err(Error::Wire);
     }
-    let mut extents = [0usize; 8];
+    let mut shape = Vec::with_capacity(ndim);
     let mut numel = 1usize;
-    for index in 0..ndim {
-        let extent = read_u32(bytes, 16 + 4 * index)? as usize;
-        extents[index] = extent;
+    for chunk in bytes[16..header].chunks_exact(4) {
+        let extent = read_u32(chunk, 0)? as usize;
         numel = numel.checked_mul(extent).ok_or(Error::Shape)?;
+        shape.push(extent);
     }
     let nbytes = numel.checked_mul(dtype.size_of()).ok_or(Error::Shape)?;
     let payload = &bytes[header..];
     if payload.len() != nbytes {
         return Err(Error::Wire);
     }
-    let mut shape = Vec::with_capacity(ndim);
-    shape.extend_from_slice(&extents[..ndim]);
     Ok((dtype, shape, payload.to_vec()))
 }
 
