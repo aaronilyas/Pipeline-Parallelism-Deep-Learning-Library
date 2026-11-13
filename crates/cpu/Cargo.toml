@@ -6,6 +6,9 @@ rust-version = "1.82"
 license = "MIT"
 publish = false
 
+[features]
+debug-counters = []
+
 [dependencies]
 linalg-core = { path = "../core" }
 half = "=2.7.1"

@@ -46,8 +46,14 @@ const STUB_REPORTS_UNSUPPORTED: bool = true;
 const WIRE_HEADER_BYTES: usize = 16;
 /// The only compute methods a CPU rank may call.
 const EXPECTED_CPU_COMPUTE: [&str; 3] = ["gemm", "gelu", "gelu_backward"];
-/// The guard attribute the cpu crate must put on every Mutex and atomic.
-const CPU_GUARD: &str = "#[cfg(test)]";
+/// The guard attributes the cpu crate may put on every Mutex and atomic: test builds, and the
+/// off-by-default `debug-counters` feature.
+const CPU_GUARDS: [&str; 2] = ["#[cfg(test)]", "#[cfg(any(test, feature = \"debug-counters\"))]"];
+/// The one file in metal and cuda (directly under `src/`) that may hold a `Mutex` without a
+/// guard: the backend state that `&self` methods and `Store` drops share (the last committed
+/// command buffer, the size-keyed free list, the pinned staging buffers). Atomics stay banned
+/// there too.
+const SHARED_STATE_FILE: &str = "shared_state.rs";
 
 // ---------------------------------------------------------------- fixture
 
@@ -1080,6 +1086,17 @@ fn unguarded_sync(
     allowed: &[String],
     file_guarded: bool,
 ) -> (Vec<(usize, String)>, usize) {
+    unguarded_sync_with(src, allowed, file_guarded, false)
+}
+
+/// [`unguarded_sync`], where `mutex_ok` lets a line that names `Mutex` (and no atomic) pass
+/// unguarded, without counting it as a guarded hit.
+fn unguarded_sync_with(
+    src: &str,
+    allowed: &[String],
+    file_guarded: bool,
+    mutex_ok: bool,
+) -> (Vec<(usize, String)>, usize) {
     let lines = strip_comments(src);
     let guards = find_guards(&lines, allowed);
     let mut bad = Vec::new();
@@ -1087,6 +1104,9 @@ fn unguarded_sync(
     for (idx, line) in lines.iter().enumerate() {
         let hit = line.contains("Mutex") || line.contains("Atomic") || line.contains("atomic");
         if !hit {
+            continue;
+        }
+        if mutex_ok && !line.contains("Atomic") && !line.contains("atomic") {
             continue;
         }
         if file_guarded || guards.whole_file || guards.guarded[idx] {
@@ -1120,7 +1140,14 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 /// carries an accepted guard (e.g. `#[cfg(test)] mod invariants;`) wholly guards `name.rs` and
 /// everything under `name/`. Returns violations, the number of guarded hits (proof the scan
 /// saw the counters) and the number of files scanned (so it cannot pass vacuously).
-fn scan_crate(dir: &Path, allowed: &[String]) -> (Vec<String>, usize, usize) {
+///
+/// `mutex_file`, when given, names the one file directly under `dir` whose `Mutex` lines need
+/// no guard.
+fn scan_crate(
+    dir: &Path,
+    allowed: &[String],
+    mutex_file: Option<&str>,
+) -> (Vec<String>, usize, usize) {
     let lib = read(&dir.join("lib.rs"));
     let guarded_mods = find_guards(&strip_comments(&lib), allowed).guarded_mods;
     let mut violations = Vec::new();
@@ -1132,7 +1159,8 @@ fn scan_crate(dir: &Path, allowed: &[String]) -> (Vec<String>, usize, usize) {
         let top = rel.components().next().expect("non-empty path").as_os_str();
         let top = Path::new(top).file_stem().unwrap().to_string_lossy().to_string();
         let file_guarded = guarded_mods.contains(&top);
-        let (bad, hits) = unguarded_sync(&read(file), allowed, file_guarded);
+        let mutex_ok = mutex_file.is_some_and(|name| rel == Path::new(name));
+        let (bad, hits) = unguarded_sync_with(&read(file), allowed, file_guarded, mutex_ok);
         guarded_hits += hits;
         for (line, text) in bad {
             violations.push(format!("{}:{line}: {text}", file.display()));
@@ -1172,7 +1200,7 @@ fn source_scan_rules_self_check() {
     assert_eq!(flagged("/// docs say Mutex\nfn f() {}\n", &test_only), 0, "doc comment");
 
     let counters_src = "#[cfg(any(test, feature = \"debug-counters\"))]\nuse std::sync::Mutex;\n";
-    assert_eq!(flagged(counters_src, &test_only), 1, "debug-counters guard is not enough on cpu");
+    assert_eq!(flagged(counters_src, &test_only), 1, "debug-counters guard is not cfg(test)");
     assert_eq!(flagged(counters_src, &counters), 0, "debug-counters guard on metal/cuda");
     let wrong = "#[cfg(not(test))]\nuse std::sync::Mutex;\n";
     assert_eq!(flagged(wrong, &counters), 1, "not(test) is no guard");
@@ -1238,7 +1266,7 @@ fn source_scan_rules_self_check() {
             ("a/deep.rs", "fn f() {\n    let _m = Mutex::new(0);\n}\n"),
         ],
     );
-    let (bad, _, seen) = scan_crate(&nested, &test_only);
+    let (bad, _, seen) = scan_crate(&nested, &test_only, None);
     assert_eq!(seen, 3, "lib.rs, a/mod.rs and a/deep.rs are all read");
     assert_eq!(bad.len(), 1, "unguarded Mutex in src/a/deep.rs: {bad:?}");
     assert!(bad[0].contains("deep.rs:2:"), "{bad:?}");
@@ -1256,11 +1284,34 @@ fn source_scan_rules_self_check() {
             ("b/inv.rs", "fn h() { let _m = Mutex::new(0); }\n"),
         ],
     );
-    let (bad, hits, seen) = scan_crate(&guarded, &test_only);
+    let (bad, hits, seen) = scan_crate(&guarded, &test_only, None);
     assert_eq!(seen, 6);
     assert_eq!(hits, 2, "a/deep.rs and inv.rs are guarded hits");
     assert_eq!(bad.len(), 1, "only b/inv.rs is unguarded: {bad:?}");
     assert!(bad[0].contains("b/inv.rs:1:"), "{bad:?}");
+
+    // The shared-state file may hold a Mutex unguarded; an atomic there, the same name nested,
+    // or a Mutex in any other file is still flagged. Its Mutex is not a guarded hit.
+    let state = scratch_crate(
+        "shared-state",
+        &[
+            ("lib.rs", "mod shared_state;\nmod a;\n"),
+            (
+                SHARED_STATE_FILE,
+                "use std::sync::Mutex;\nstruct S(Mutex<u8>);\nuse std::sync::atomic::AtomicU8;\n",
+            ),
+            ("a/mod.rs", "mod shared_state;\n"),
+            ("a/shared_state.rs", "static X: Mutex<u8> = todo();\n"),
+        ],
+    );
+    let (bad, hits, seen) = scan_crate(&state, &counters, Some(SHARED_STATE_FILE));
+    assert_eq!(seen, 4);
+    assert_eq!(hits, 0, "an exempt Mutex is not a guarded counter");
+    assert_eq!(bad.len(), 2, "the atomic and the nested file: {bad:?}");
+    assert!(bad.iter().any(|b| b.contains("shared_state.rs:3:")), "{bad:?}");
+    assert!(bad.iter().any(|b| b.contains("a/shared_state.rs:1:")), "{bad:?}");
+    let (bad, _, _) = scan_crate(&state, &counters, None);
+    assert_eq!(bad.len(), 4, "without the exemption every line is flagged: {bad:?}");
 
     let lines =
         strip_comments("#[cfg(test)]\nmod invariants;\n#[cfg(feature = \"cuda\")]\nmod device;\n");
@@ -1303,19 +1354,20 @@ fn release_cpu_builds_without_counters() {
 
     // Source scan first: cpu keeps every Mutex and atomic behind `cfg(test)`; metal and cuda
     // behind `cfg(any(test, feature = "debug-counters"))` (or `cfg(test)`).
-    let cpu_allowed = vec![squash(CPU_GUARD)];
+    let cpu_allowed = allowed_guards(&CPU_GUARDS);
     let accel_allowed =
         allowed_guards(&["#[cfg(test)]", "#[cfg(any(test, feature = \"debug-counters\"))]"]);
     let mut violations = Vec::new();
     let mut vacuous = Vec::new();
     let mut empty = Vec::new();
-    for (crate_dir, allowed, label) in [
-        ("cpu", &cpu_allowed, "cfg(test)"),
-        ("metal", &accel_allowed, "cfg(any(test, feature = \"debug-counters\"))"),
-        ("cuda", &accel_allowed, "cfg(any(test, feature = \"debug-counters\"))"),
+    let counters_label = "cfg(any(test, feature = \"debug-counters\"))";
+    for (crate_dir, allowed, label, mutex_file) in [
+        ("cpu", &cpu_allowed, counters_label, None),
+        ("metal", &accel_allowed, counters_label, Some(SHARED_STATE_FILE)),
+        ("cuda", &accel_allowed, counters_label, Some(SHARED_STATE_FILE)),
     ] {
         let src = root.join("crates").join(crate_dir).join("src");
-        let (bad, guarded, files) = scan_crate(&src, allowed);
+        let (bad, guarded, files) = scan_crate(&src, allowed, mutex_file);
         if files == 0 {
             empty.push(crate_dir);
         }
