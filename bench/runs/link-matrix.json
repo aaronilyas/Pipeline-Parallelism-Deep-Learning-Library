@@ -1,0 +1,190 @@
+{
+  "bf16_bytes_per_sample_per_direction": 8192,
+  "command": "python3 bench/net/link_matrix.py",
+  "commit": "26c285d32476e1a19d8dc6d088f3a67d71978c21",
+  "duration_s": 30.0,
+  "endpoints": {
+    "macmini": {
+      "ipv4": "192.168.1.132",
+      "medium": "Wi-Fi 802.11ax (en1), 5 GHz; Ethernet en0 inactive",
+      "runtime": "native",
+      "ssh": "macmini"
+    },
+    "ubuntu": {
+      "ipv4": "192.168.1.137",
+      "medium": "Ethernet, r8169 NIC, negotiated 100 Mb/s full duplex (kernel: 'downshifted')",
+      "runtime": "native",
+      "ssh": "ubuntu"
+    },
+    "windows": {
+      "ipv4": "192.168.1.246",
+      "medium": "Wi-Fi 6E (Intel AX211), Wi-Fi adapter is the only physical link up",
+      "runtime": "native",
+      "ssh": "windows"
+    },
+    "windows-wsl": {
+      "ipv4": "192.168.1.246",
+      "medium": "WSL2 mirrored networking over the windows Wi-Fi adapter",
+      "runtime": "wsl2 Ubuntu-26.04 mirrored",
+      "ssh": "windows"
+    }
+  },
+  "f32_bytes_per_sample_per_direction": 16384,
+  "hub": "omarchy",
+  "medium_raw": {
+    "macmini": "interface: en1\nHardware Port: Wi-Fi\nDevice: en1\n\tstatus: inactive\n              PHY Mode: 802.11ax\n              Channel: 149 (5GHz, 80MHz)\n              Transmit Rate: 130",
+    "ubuntu": "speed=100\nduplex=full\nwireless=no\nNov 11 17:08:10 aaron-B250M-DS3H kernel: r8169 0000:03:00.0 enp3s0: Link is Up - 100Mbps/Full (downshifted) - flow control off",
+    "windows": "Name                               InterfaceDescription                       LinkSpeed MediaType    \n----                               --------------------                       --------- ---------    \nWi-Fi                              Intel(R) Wi-Fi 6E AX211 160MHz             229 Mbps  Native 802.11\nvEthernet (WSL (Hyper-V firewall)) Hyper-V Virtual Ethernet Adapter           10 Gbps   802.3        \nvEthernet (FSE HostVnic)           Hyper-V Virtual Ethernet Container Adapter 10 Gbps   802.3        \n\n\n\n\nThere is 1 interface on the system: \n\n    Name                   : Wi-Fi\n    Description            : Intel(R) Wi-Fi 6E AX211 160MHz\n    GUID                   : cfccbbda-7f6e-4111-9641-82078e99a589\n    Physical address       : 00:93:37:eb:2c:e2\n    Interface type         : Primary\n    State                  : connected\n    SSID                   : Teddy\n    AP BSSID               : a2:b5:3c:1c:2d:4c\n    Band                   : 2.4 GHz\n    Channel                : 1\n    Connected Akm-cipher   : [ akm = 00-0f-ac:02, cipher =  00-0f-ac:04 ]\n    Network type           : Infrastructure\n    Radio type             : 802.11ax\n    Authentication         : WPA2-Personal\n    Cipher                 : CCMP\n    Connection mode        : Auto Connect\n    Receive rate (Mbps)    : 229\n    Transmit rate (Mbps)   : 229\n    Signal                 : 82% \n    Rssi                   : -61\n    Profile                : Teddy \n    QoS MSCS Configured         : 0\n    QoS Map Configured          : 0\n    QoS Map Allowed by Policy   : 0"
+  },
+  "runs": [
+    {
+      "bf16_ceiling_samples_per_sec": 1436.0463944905732,
+      "bytes": 355598336,
+      "bytes_per_sec": 11764092.063666776,
+      "commands": [
+        "ssh ubuntu ~/ppdl-w-bench/venv/bin/python ~/ppdl-w-bench/net/linkperf.py server 5201",
+        "ssh macmini ~/ppdl-w-bench/venv/bin/python ~/ppdl-w-bench/net/linkperf.py client 192.168.1.137 5201 send 30"
+      ],
+      "duration_s": 30.0,
+      "error": null,
+      "f32_ceiling_samples_per_sec": 718.0231972452866,
+      "from": "macmini",
+      "listener": "ubuntu",
+      "mbit_per_sec": 94.11273650933421,
+      "mode": "send",
+      "seconds": 30.227435664011864,
+      "started_utc": "2026-11-13T11:26:27.732967+00:00",
+      "status": "ok",
+      "to": "ubuntu"
+    },
+    {
+      "bf16_ceiling_samples_per_sec": 1401.167561700518,
+      "bytes": 347340800,
+      "bytes_per_sec": 11478364.665450644,
+      "commands": [
+        "ssh ubuntu ~/ppdl-w-bench/venv/bin/python ~/ppdl-w-bench/net/linkperf.py server 5202",
+        "ssh macmini ~/ppdl-w-bench/venv/bin/python ~/ppdl-w-bench/net/linkperf.py client 192.168.1.137 5202 recv 30"
+      ],
+      "duration_s": 30.0,
+      "error": null,
+      "f32_ceiling_samples_per_sec": 700.583780850259,
+      "from": "ubuntu",
+      "listener": "ubuntu",
+      "mbit_per_sec": 91.82691732360514,
+      "mode": "recv",
+      "seconds": 30.26047787499556,
+      "started_utc": "2026-11-13T11:27:20.515887+00:00",
+      "status": "ok",
+      "to": "macmini"
+    },
+    {
+      "bf16_ceiling_samples_per_sec": 206.6568356203487,
+      "bytes": 50987008,
+      "bytes_per_sec": 1692932.7974018964,
+      "commands": [
+        "ssh ubuntu ~/ppdl-w-bench/venv/bin/python ~/ppdl-w-bench/net/linkperf.py server 5203",
+        "ssh windows & $env:USERPROFILE\\ppdl-w-bench\\venv\\Scripts\\python.exe $env:USERPROFILE\\ppdl-w-bench\\net\\linkperf.py client 192.168.1.137 5203 send 30"
+      ],
+      "duration_s": 30.0,
+      "error": null,
+      "f32_ceiling_samples_per_sec": 103.32841781017434,
+      "from": "windows",
+      "listener": "ubuntu",
+      "mbit_per_sec": 13.543462379215171,
+      "mode": "send",
+      "seconds": 30.117561711987946,
+      "started_utc": "2026-11-13T11:28:13.996638+00:00",
+      "status": "ok",
+      "to": "ubuntu"
+    },
+    {
+      "bf16_ceiling_samples_per_sec": 578.2059695363996,
+      "bytes": 145227776,
+      "bytes_per_sec": 4736663.302442186,
+      "commands": [
+        "ssh ubuntu ~/ppdl-w-bench/venv/bin/python ~/ppdl-w-bench/net/linkperf.py server 5204",
+        "ssh windows & $env:USERPROFILE\\ppdl-w-bench\\venv\\Scripts\\python.exe $env:USERPROFILE\\ppdl-w-bench\\net\\linkperf.py client 192.168.1.137 5204 recv 30"
+      ],
+      "duration_s": 30.0,
+      "error": null,
+      "f32_ceiling_samples_per_sec": 289.1029847681998,
+      "from": "ubuntu",
+      "listener": "ubuntu",
+      "mbit_per_sec": 37.89330641953748,
+      "mode": "recv",
+      "seconds": 30.660354499996174,
+      "started_utc": "2026-11-13T11:29:06.932102+00:00",
+      "status": "ok",
+      "to": "windows"
+    },
+    {
+      "commands": [
+        "ssh macmini ~/ppdl-w-bench/venv/bin/python ~/ppdl-w-bench/net/linkperf.py server 5205",
+        "ssh windows & $env:USERPROFILE\\ppdl-w-bench\\venv\\Scripts\\python.exe $env:USERPROFILE\\ppdl-w-bench\\net\\linkperf.py client 192.168.1.132 5205 send 30"
+      ],
+      "duration_s": 30.0,
+      "error": "Traceback (most recent call last):\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\net\\linkperf.py\", line 128, in <module>\n    raise SystemExit(main(sys.argv))\n                     ^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\net\\linkperf.py\", line 122, in main\n    return client(argv[2], int(argv[3]), argv[4], float(argv[5]))\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\net\\linkperf.py\", line 108, in client\n    sent = send_for(conn, seconds)\n           ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\net\\linkperf.py\", line 34, in send_for\n    sock.sendall(payload)\nConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host\n\nTraceback (most recent call last):\n  File \"/Users/aaronilyas/ppdl-w-bench/net/linkperf.py\", line 128, in <module>\n    raise SystemExit(main(sys.argv))\n                     ^^^^^^^^^^^^^^\n  File \"/Users/aaronilyas/ppdl-w-bench/net/linkperf.py\", line 120, in main\n    return server(int(argv[2]))\n           ^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aaronilyas/ppdl-w-bench/net/linkperf.py\", line 79, in server\n    conn, address = listener.accept()\n                    ^^^^^^^^^^^^^^^^^\n  File \"/Users/aaronilyas/.local/share/uv/python/cpython-3.12.16-macos-aarch64-none/lib/python3.12/socket.py\", line 295, in accept\n    fd, addr = self._accept()\n               ^^^^^^^^^^^^^^\nTimeoutError: timed out\n",
+      "from": "windows",
+      "listener": "macmini",
+      "mode": "send",
+      "started_utc": "2026-11-13T11:30:00.529851+00:00",
+      "status": "not run",
+      "to": "macmini"
+    },
+    {
+      "commands": [
+        "ssh macmini ~/ppdl-w-bench/venv/bin/python ~/ppdl-w-bench/net/linkperf.py server 5206",
+        "ssh windows & $env:USERPROFILE\\ppdl-w-bench\\venv\\Scripts\\python.exe $env:USERPROFILE\\ppdl-w-bench\\net\\linkperf.py client 192.168.1.132 5206 recv 30"
+      ],
+      "duration_s": 30.0,
+      "error": "Traceback (most recent call last):\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\net\\linkperf.py\", line 128, in <module>\n    raise SystemExit(main(sys.argv))\n                     ^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\net\\linkperf.py\", line 122, in main\n    return client(argv[2], int(argv[3]), argv[4], float(argv[5]))\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\net\\linkperf.py\", line 112, in client\n    report(\"client\", conn.getsockname()[0], host, receive_all(conn))\n                                                  ^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\net\\linkperf.py\", line 47, in receive_all\n    count = sock.recv_into(view)\n            ^^^^^^^^^^^^^^^^^^^^\nConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host\n\nTraceback (most recent call last):\n  File \"/Users/aaronilyas/ppdl-w-bench/net/linkperf.py\", line 128, in <module>\n    raise SystemExit(main(sys.argv))\n                     ^^^^^^^^^^^^^^\n  File \"/Users/aaronilyas/ppdl-w-bench/net/linkperf.py\", line 120, in main\n    return server(int(argv[2]))\n           ^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aaronilyas/ppdl-w-bench/net/linkperf.py\", line 79, in server\n    conn, address = listener.accept()\n                    ^^^^^^^^^^^^^^^^^\n  File \"/Users/aaronilyas/.local/share/uv/python/cpython-3.12.16-macos-aarch64-none/lib/python3.12/socket.py\", line 295, in accept\n    fd, addr = self._accept()\n               ^^^^^^^^^^^^^^\nTimeoutError: timed out\n",
+      "from": "macmini",
+      "listener": "macmini",
+      "mode": "recv",
+      "started_utc": "2026-11-13T11:32:03.074147+00:00",
+      "status": "not run",
+      "to": "windows"
+    },
+    {
+      "bf16_ceiling_samples_per_sec": 169.65290790262299,
+      "bytes": 43909120,
+      "bytes_per_sec": 1389796.6215382875,
+      "commands": [
+        "ssh ubuntu ~/ppdl-w-bench/venv/bin/python ~/ppdl-w-bench/net/linkperf.py server 5207",
+        "ssh windows wsl -d Ubuntu-26.04 -e python3 /mnt/c/Users/aaron/ppdl-w-bench/net/linkperf.py client 192.168.1.137 5207 send 30"
+      ],
+      "duration_s": 30.0,
+      "error": null,
+      "f32_ceiling_samples_per_sec": 84.82645395131149,
+      "from": "windows-wsl",
+      "listener": "ubuntu",
+      "mbit_per_sec": 11.1183729723063,
+      "mode": "send",
+      "seconds": 31.593917641992448,
+      "started_utc": "2026-11-13T11:34:05.617969+00:00",
+      "status": "ok",
+      "to": "ubuntu"
+    },
+    {
+      "bf16_ceiling_samples_per_sec": 488.5026290505867,
+      "bytes": 122159104,
+      "bytes_per_sec": 4001813.537182406,
+      "commands": [
+        "ssh ubuntu ~/ppdl-w-bench/venv/bin/python ~/ppdl-w-bench/net/linkperf.py server 5208",
+        "ssh windows wsl -d Ubuntu-26.04 -e python3 /mnt/c/Users/aaron/ppdl-w-bench/net/linkperf.py client 192.168.1.137 5208 recv 30"
+      ],
+      "duration_s": 30.0,
+      "error": null,
+      "f32_ceiling_samples_per_sec": 244.25131452529334,
+      "from": "ubuntu",
+      "listener": "ubuntu",
+      "mbit_per_sec": 32.01450829745925,
+      "mode": "recv",
+      "seconds": 30.525936019999996,
+      "started_utc": "2026-11-13T11:35:05.374299+00:00",
+      "status": "ok",
+      "to": "windows-wsl"
+    }
+  ],
+  "tool": "bench/net/linkperf.py (iperf3-equivalent TCP stream, receiver-side count)"
+}
