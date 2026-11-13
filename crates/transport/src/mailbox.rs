@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 struct State {
     queue: VecDeque<Vec<u8>>,
-    closed: bool,
 }
 
 #[derive(Default)]
@@ -28,25 +27,14 @@ impl Mailbox {
         Ok(())
     }
 
-    /// No further messages will arrive; queued ones can still be popped.
-    pub(crate) fn close(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.closed = true;
-        drop(state);
-        self.ready.notify_all();
-    }
-
     /// Pops the oldest message, waiting up to `timeout`. An empty mailbox at
-    /// the deadline, or an empty closed mailbox, is `Error::Transport`.
+    /// the deadline is `Error::Transport`.
     pub(crate) fn pop_timeout(&self, timeout: Duration) -> Result<Vec<u8>, Error> {
         let deadline = Instant::now().checked_add(timeout);
         let mut state = self.lock()?;
         loop {
             if let Some(message) = state.queue.pop_front() {
                 return Ok(message);
-            }
-            if state.closed {
-                return Err(Error::Transport);
             }
             state = match deadline {
                 Some(deadline) => {
