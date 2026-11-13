@@ -49,4 +49,13 @@ impl Transport for LoopbackEndpoint {
         }
         self.hub.boxes[self.rank * self.hub.world + src].pop_timeout(timeout)
     }
+
+    // Not yet implemented by this transport; see the core contract.
+    fn send_parts(&self, _dest: usize, _parts: &[&[u8]]) -> Result<(), Error> {
+        Err(Error::Transport)
+    }
+
+    fn recv_into(&self, _src: usize, _buf: &mut Vec<u8>, _timeout: Duration) -> Result<(), Error> {
+        Err(Error::Transport)
+    }
 }

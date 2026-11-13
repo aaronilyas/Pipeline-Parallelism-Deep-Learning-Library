@@ -35,6 +35,14 @@ impl Transport for IdleTransport {
     fn recv_timeout(&self, _src: usize, _timeout: Duration) -> Result<Vec<u8>, Error> {
         Err(Error::Transport)
     }
+
+    fn send_parts(&self, _dest: usize, _parts: &[&[u8]]) -> Result<(), Error> {
+        Err(Error::Transport)
+    }
+
+    fn recv_into(&self, _src: usize, _buf: &mut Vec<u8>, _timeout: Duration) -> Result<(), Error> {
+        Err(Error::Transport)
+    }
 }
 
 /// The pipeline entry point, monomorphized on the CPU backend.

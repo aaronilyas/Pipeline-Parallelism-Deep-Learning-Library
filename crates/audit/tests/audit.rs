@@ -182,6 +182,64 @@ impl<B: Backend> Backend for Counting<B> {
         self.note("gelu_backward", &dtypes, self.inner.gelu_backward(pre, dy, dx))
     }
 
+    fn download_into(&self, tensor: &Tensor<Self::Store>, out: &mut [u8]) -> Result<(), Error> {
+        self.note("download_into", &[tensor.dtype], self.inner.download_into(tensor, out))
+    }
+
+    fn upload_into(&self, bytes: &[u8], tensor: &mut Tensor<Self::Store>) -> Result<(), Error> {
+        let dtypes = [tensor.dtype];
+        self.note("upload_into", &dtypes, self.inner.upload_into(bytes, tensor))
+    }
+
+    fn sync(&self) -> Result<(), Error> {
+        self.note("sync", &[], self.inner.sync())
+    }
+
+    fn add_bias(
+        &self,
+        x: &Tensor<Self::Store>,
+        b: &Tensor<Self::Store>,
+        y: &mut Tensor<Self::Store>,
+    ) -> Result<(), Error> {
+        let dtypes = [x.dtype, b.dtype, y.dtype];
+        self.note("add_bias", &dtypes, self.inner.add_bias(x, b, y))
+    }
+
+    fn bias_grad(
+        &self,
+        dpre: &Tensor<Self::Store>,
+        db: &mut Tensor<Self::Store>,
+    ) -> Result<(), Error> {
+        let dtypes = [dpre.dtype, db.dtype];
+        self.note("bias_grad", &dtypes, self.inner.bias_grad(dpre, db))
+    }
+
+    fn mse_grad(
+        &self,
+        y: &Tensor<Self::Store>,
+        target: &Tensor<Self::Store>,
+        dy: &mut Tensor<Self::Store>,
+        loss: &mut f32,
+    ) -> Result<(), Error> {
+        let dtypes = [y.dtype, target.dtype, dy.dtype];
+        self.note("mse_grad", &dtypes, self.inner.mse_grad(y, target, dy, loss))
+    }
+
+    fn sgd_step(
+        &self,
+        w: &mut Tensor<Self::Store>,
+        dw: &mut Tensor<Self::Store>,
+        lr: f32,
+    ) -> Result<(), Error> {
+        let dtypes = [w.dtype, dw.dtype];
+        self.note("sgd_step", &dtypes, self.inner.sgd_step(w, dw, lr))
+    }
+
+    fn convert(&self, x: &Tensor<Self::Store>, y: &mut Tensor<Self::Store>) -> Result<(), Error> {
+        let dtypes = [x.dtype, y.dtype];
+        self.note("convert", &dtypes, self.inner.convert(x, y))
+    }
+
     fn debug_allocs(&self) -> u64 {
         self.inner.debug_allocs()
     }
@@ -234,6 +292,18 @@ impl<T: Transport> Transport for Logged<T> {
         self.received.set(self.received.get() + 1);
         Ok(bytes)
     }
+
+    fn send_parts(&self, dest: usize, parts: &[&[u8]]) -> Result<(), Error> {
+        self.inner.send_parts(dest, parts)?;
+        self.sent.borrow_mut().push(parts.iter().map(|part| part.len()).sum());
+        Ok(())
+    }
+
+    fn recv_into(&self, src: usize, buf: &mut Vec<u8>, timeout: Duration) -> Result<(), Error> {
+        self.inner.recv_into(src, buf, timeout)?;
+        self.received.set(self.received.get() + 1);
+        Ok(())
+    }
 }
 
 /// World of one: every send or recv is a contract violation.
@@ -253,6 +323,14 @@ impl Transport for Solo {
     }
 
     fn recv_timeout(&self, _src: usize, _timeout: Duration) -> Result<Vec<u8>, Error> {
+        Err(Error::Transport)
+    }
+
+    fn send_parts(&self, _dest: usize, _parts: &[&[u8]]) -> Result<(), Error> {
+        Err(Error::Transport)
+    }
+
+    fn recv_into(&self, _src: usize, _buf: &mut Vec<u8>, _timeout: Duration) -> Result<(), Error> {
         Err(Error::Transport)
     }
 }

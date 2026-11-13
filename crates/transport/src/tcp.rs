@@ -94,6 +94,15 @@ impl Transport for TcpEndpoint {
         let peer = self.peers.get(src).and_then(Option::as_ref).ok_or(Error::Transport)?;
         peer.inbox.pop_timeout(timeout)
     }
+
+    // Not yet implemented by this transport; see the core contract.
+    fn send_parts(&self, _dest: usize, _parts: &[&[u8]]) -> Result<(), Error> {
+        Err(Error::Transport)
+    }
+
+    fn recv_into(&self, _src: usize, _buf: &mut Vec<u8>, _timeout: Duration) -> Result<(), Error> {
+        Err(Error::Transport)
+    }
 }
 
 /// Builds a full mesh of `world` endpoints over 127.0.0.1 with OS-assigned
