@@ -1,0 +1,52 @@
+
+__REPORT__
+{
+  "error": "Traceback (most recent call last):\n  File \"/Users/aaronilyas/ppdl-w-bench/pytorch/gloo_probe.py\", line 30, in main\n    init_gloo(\n  File \"/Users/aaronilyas/ppdl-w-bench/pytorch/rendezvous.py\", line 32, in init_gloo\n    dist.init_process_group(\n  File \"/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py\", line 83, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py\", line 97, in wrapper\n    func_return = func(*args, **kwargs)\n                  ^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py\", line 2553, in init_process_group\n    default_pg, _ = _new_process_group_helper(\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py\", line 2874, in _new_process_group_helper\n    backend_result = creator_fn(dist_backend_opts, backend_options)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py\", line 669, in _create_gloo_process_group\n    backend_class = ProcessGroupGloo(\n                    ^^^^^^^^^^^^^^^^^\ntorch.distributed.DistNetworkError: Connection reset by peer\n",
+  "hostname": "Aarons-Mac-mini-2.local",
+  "rank": 1,
+  "status": "not run",
+  "world": 3
+}
+
+--- stderr ---
+/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /Users/runner/work/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[W1112 19:32:47.060005000 TCPStore.cpp:139] [c10d] recvValueWithTimeout failed on SocketImpl(fd=4, addr=[::192.168.1.132]:49501, remote=[::ffff:192.168.1.137]:29791): Connection reset by peer
+Exception raised from recvBytes at /Users/runner/work/pytorch/pytorch/torch/csrc/distributed/c10d/Utils.hpp:788 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>) + 52 (0x10675fd08 in libc10.dylib)
+frame #1: c10::DistNetworkError::DistNetworkError(c10::SourceLocation, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>) + 80 (0x106761270 in libc10.dylib)
+frame #2: void c10d::tcputil::recvBytes<c10d::detail::WaitResponseType>(int, c10d::detail::WaitResponseType*, unsigned long) + 444 (0x1275b464c in libtorch_cpu.dylib)
+frame #3: std::__1::optional<c10d::detail::WaitResponseType> c10d::detail::TCPClient::receiveValueWithTimeout<c10d::detail::WaitResponseType>(std::__1::chrono::duration<long long, std::__1::ratio<1l, 1000l>>) + 52 (0x1275b4150 in libtorch_cpu.dylib)
+frame #4: c10d::TCPStore::doWait(c10::ArrayRef<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>, std::__1::chrono::duration<long long, std::__1::ratio<1l, 1000l>>) + 268 (0x1275b3618 in libtorch_cpu.dylib)
+frame #5: c10d::TCPStore::doGet(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) + 44 (0x1275b1ca8 in libtorch_cpu.dylib)
+frame #6: c10d::TCPStore::get(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) + 312 (0x1275ab498 in libtorch_cpu.dylib)
+frame #7: c10d::PrefixStore::get(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) + 56 (0x12754e39c in libtorch_cpu.dylib)
+frame #8: c10d::PrefixStore::get(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) + 56 (0x12754e39c in libtorch_cpu.dylib)
+frame #9: c10d::ProcessGroupGloo::GlooStore::get(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) + 44 (0x12757e5a8 in libtorch_cpu.dylib)
+frame #10: gloo::rendezvous::PrefixStore::get(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) + 56 (0x127a16a28 in libtorch_cpu.dylib)
+frame #11: gloo::transport::Context::createAndConnectAllPairs(std::__1::shared_ptr<gloo::IStore>) + 1756 (0x127a18458 in libtorch_cpu.dylib)
+frame #12: gloo::rendezvous::Context::connectFullMesh(std::__1::shared_ptr<gloo::rendezvous::Store>, std::__1::shared_ptr<gloo::transport::Device>&) + 112 (0x127a15330 in libtorch_cpu.dylib)
+frame #13: c10d::ProcessGroupGloo::connectContexts(int, int, c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store>> const&) + 448 (0x12757db60 in libtorch_cpu.dylib)
+frame #14: c10d::ProcessGroupGloo::ProcessGroupGloo(c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store>> const&, int, int, c10::intrusive_ptr<c10d::ProcessGroupGloo::Options, c10::detail::intrusive_target_default_null_type<c10d::ProcessGroupGloo::Options>>) + 456 (0x12757d4a4 in libtorch_cpu.dylib)
+frame #15: void pybind11::detail::function_ref<void (pybind11::detail::value_and_holder&, c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store>> const&, int, int, std::__1::chrono::duration<long long, std::__1::ratio<1l, 1000l>>, bool)>::callback_fn<void pybind11::detail::initimpl::factory<torch::distributed::c10d::(anonymous namespace)::c10d_init(_object*, _object*)::$_99, pybind11::detail::void_type (*)(), c10::intrusive_ptr<c10d::ProcessGroupGloo, c10::detail::intrusive_target_default_null_type<c10d::ProcessGroupGloo>> (c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store>> const&, int, int, std::__1::chrono::duration<long long, std::__1::ratio<1l, 1000l>>, bool), pybind11::detail::void_type ()>::execute<pybind11::class_<c10d::ProcessGroupGloo, (anonymous namespace)::IntrusivePtrNoGilDestructor<c10d::ProcessGroupGloo>>, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v, char [40]>(pybind11::class_<c10d::ProcessGroupGloo, (anonymous namespace)::IntrusivePtrNoGilDestructor<c10d::ProcessGroupGloo>>&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&, char const (&) [40]) &&::'lambda'(pybind11::detail::value_and_holder&, c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store>> const&, int, int, std::__1::chrono::duration<long long, std::__1::ratio<1l, 1000l>>, bool)>(long, pybind11::detail::value_and_holder&, c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store>> const&, int, int, std::__1::chrono::duration<long long, std::__1::ratio<1l, 1000l>>, bool) + 144 (0x109005008 in libtorch_python.dylib)
+frame #16: pybind11::handle pybind11::cpp_function::call_impl<void, pybind11::detail::void_type, pybind11::detail::argument_loader<pybind11::detail::value_and_holder&, c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store>> const&, int, int, std::__1::chrono::duration<long long, std::__1::ratio<1l, 1000l>>, bool>, pybind11::detail::value_and_holder&, c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store>> const&, int, int, std::__1::chrono::duration<long long, std::__1::ratio<1l, 1000l>>, bool>(pybind11::detail::function_call&, pybind11::detail::function_ref<void (pybind11::detail::value_and_holder&, c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store>> const&, int, int, std::__1::chrono::duration<long long, std::__1::ratio<1l, 1000l>>, bool)>) + 132 (0x109004cb0 in libtorch_python.dylib)
+frame #17: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) + 3416 (0x10836d860 in libtorch_python.dylib)
+frame #18: cfunction_vectorcall_FASTCALL_KEYWORDS + 92 (0x10070e594 in python3.12)
+frame #19: method_vectorcall + 292 (0x1006f874c in python3.12)
+frame #20: _PyObject_Call + 276 (0x1004bfc6c in python3.12)
+frame #21: slot_tp_init + 1832 (0x1007168d4 in python3.12)
+frame #22: type_call + 148 (0x100719824 in python3.12)
+frame #23: pybind11_meta_call + 40 (0x108368d54 in libtorch_python.dylib)
+frame #24: _PyEval_EvalFrameDefault + 225784 (0x1005239b8 in python3.12)
+frame #25: PyEval_EvalCode + 216 (0x10058e3fc in python3.12)
+frame #26: run_mod + 228 (0x10058e1d4 in python3.12)
+frame #27: pyrun_file + 156 (0x100696f48 in python3.12)
+frame #28: _PyRun_SimpleFileObject + 288 (0x100696798 in python3.12)
+frame #29: _PyRun_AnyFileObject + 80 (0x100696530 in python3.12)
+frame #30: pymain_run_file_obj + 164 (0x1006963a4 in python3.12)
+frame #31: pymain_run_file + 72 (0x100696248 in python3.12)
+frame #32: Py_RunMain + 1136 (0x100623ecc in python3.12)
+frame #33: pymain_main + 456 (0x1005e64f8 in python3.12)
+frame #34: main + 36 (0x1005e6324 in python3.12)
+frame #35: start + 6652 (0x18bb04d7c in dyld)
+

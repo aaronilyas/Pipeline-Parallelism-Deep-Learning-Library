@@ -1,0 +1,14 @@
+
+__REPORT__
+{
+  "error": "Traceback (most recent call last):\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\pytorch\\gloo_probe.py\", line 33, in main\n    init_gloo(\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\pytorch\\rendezvous.py\", line 39, in init_gloo\n    dist.init_process_group(\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\venv\\Lib\\site-packages\\torch\\distributed\\c10d_logger.py\", line 83, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\venv\\Lib\\site-packages\\torch\\distributed\\c10d_logger.py\", line 97, in wrapper\n    func_return = func(*args, **kwargs)\n                  ^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\venv\\Lib\\site-packages\\torch\\distributed\\distributed_c10d.py\", line 2553, in init_process_group\n    default_pg, _ = _new_process_group_helper(\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\venv\\Lib\\site-packages\\torch\\distributed\\distributed_c10d.py\", line 2874, in _new_process_group_helper\n    backend_result = creator_fn(dist_backend_opts, backend_options)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\venv\\Lib\\site-packages\\torch\\distributed\\distributed_c10d.py\", line 669, in _create_gloo_process_group\n    backend_class = ProcessGroupGloo(\n                    ^^^^^^^^^^^^^^^^^\nRuntimeError: [enforce fail at C:\\actions-runner\\_work\\pytorch\\pytorch\\third_party\\gloo\\gloo\\transport\\uv\\address.cc:27] sizeof(impl_) == bytes.size(). 136 vs 184\n",
+  "hostname": "Aaron",
+  "rank": 0,
+  "status": "not run",
+  "world": 2
+}
+
+--- stderr ---
+C:\Users\aaron\ppdl-w-bench\venv\Lib\site-packages\torch\_subclasses\functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\torch\csrc\utils\tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[W1112 19:42:35.000000000 socket.cpp:764] [c10d] The client socket has failed to connect to [aaron-B250M-DS3H.lan]:29801 (system error: 10049 - The requested address is not valid in its context.).

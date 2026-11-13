@@ -1,0 +1,63 @@
+
+__REPORT__
+{
+  "error": "Traceback (most recent call last):\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\pytorch\\gloo_probe.py\", line 30, in main\n    init_gloo(\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\pytorch\\rendezvous.py\", line 32, in init_gloo\n    dist.init_process_group(\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\venv\\Lib\\site-packages\\torch\\distributed\\c10d_logger.py\", line 83, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\venv\\Lib\\site-packages\\torch\\distributed\\c10d_logger.py\", line 97, in wrapper\n    func_return = func(*args, **kwargs)\n                  ^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\venv\\Lib\\site-packages\\torch\\distributed\\distributed_c10d.py\", line 2553, in init_process_group\n    default_pg, _ = _new_process_group_helper(\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\venv\\Lib\\site-packages\\torch\\distributed\\distributed_c10d.py\", line 2874, in _new_process_group_helper\n    backend_result = creator_fn(dist_backend_opts, backend_options)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aaron\\ppdl-w-bench\\venv\\Lib\\site-packages\\torch\\distributed\\distributed_c10d.py\", line 669, in _create_gloo_process_group\n    backend_class = ProcessGroupGloo(\n                    ^^^^^^^^^^^^^^^^^\ntorch.distributed.DistNetworkError: Unknown error\n",
+  "hostname": "Aaron",
+  "rank": 0,
+  "status": "not run",
+  "world": 3
+}
+
+--- stderr ---
+C:\Users\aaron\ppdl-w-bench\venv\Lib\site-packages\torch\_subclasses\functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\torch\csrc\utils\tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[W1112 19:32:17.000000000 socket.cpp:764] [c10d] The client socket has failed to connect to [aaron-B250M-DS3H.lan]:29791 (system error: 10049 - The requested address is not valid in its context.).
+[W1112 19:32:48.000000000 TCPStore.cpp:138] [c10d] recvValueWithTimeout failed on SocketImpl(fd=1280, addr=Aaron.lan:65325, remote=aaron-B250M-DS3H.lan:29791): Unknown error
+Exception raised from recvBytes at C:\actions-runner\_work\pytorch\pytorch\torch/csrc/distributed/c10d/Utils.hpp:788 (most recent call first):
+00007FFDD1EC68ED00007FFDD1EC6840 c10.dll!c10::Error::Error [<unknown file> @ <unknown line number>]
+00007FFDD1EC640500007FFDD1EC6390 c10.dll!c10::DistError::DistError [<unknown file> @ <unknown line number>]
+00007FFDD1EC64F500007FFDD1EC6480 c10.dll!c10::DistNetworkError::DistNetworkError [<unknown file> @ <unknown line number>]
+00007FFC59A440B400007FFC59A42D20 torch_cpu.dll!c10d::Store::setTimeout [<unknown file> @ <unknown line number>]
+00007FFC59A43A9C00007FFC59A42D20 torch_cpu.dll!c10d::Store::setTimeout [<unknown file> @ <unknown line number>]
+00007FFC59A4807F00007FFC59A47E50 torch_cpu.dll!c10d::TCPStore::doWait [<unknown file> @ <unknown line number>]
+00007FFC59A47D3F00007FFC59A47D00 torch_cpu.dll!c10d::TCPStore::doGet [<unknown file> @ <unknown line number>]
+00007FFC59A484D100007FFC59A483D0 torch_cpu.dll!c10d::TCPStore::get [<unknown file> @ <unknown line number>]
+00007FFC59A0DB2000007FFC59A0DAE0 torch_cpu.dll!c10d::PrefixStore::get [<unknown file> @ <unknown line number>]
+00007FFC59A0DB2000007FFC59A0DAE0 torch_cpu.dll!c10d::PrefixStore::get [<unknown file> @ <unknown line number>]
+00007FFC599F36E900007FFC599F36C0 torch_cpu.dll!c10d::ProcessGroupGloo::GlooStore::get [<unknown file> @ <unknown line number>]
+00007FFC5A91FF0000007FFC59B9F310 torch_cpu.dll!torch::xpu::synchronize [<unknown file> @ <unknown line number>]
+00007FFC5A92472600007FFC59B9F310 torch_cpu.dll!torch::xpu::synchronize [<unknown file> @ <unknown line number>]
+00007FFC5A91F81F00007FFC59B9F310 torch_cpu.dll!torch::xpu::synchronize [<unknown file> @ <unknown line number>]
+00007FFC59A2FBD100007FFC59A2F820 torch_cpu.dll!c10d::ProcessGroupGloo::connectContexts [<unknown file> @ <unknown line number>]
+00007FFC59A1E5CD00007FFC59A1E240 torch_cpu.dll!c10d::ProcessGroupGloo::ProcessGroupGloo [<unknown file> @ <unknown line number>]
+00007FFD3BD9DB1600007FFD3BD96DA0 torch_python.dll!c10d::PythonOnCompletionHook::operator= [<unknown file> @ <unknown line number>]
+00007FFD3BD1BAC700007FFD3BC75180 torch_python.dll!torch::lazy::GetPythonFrames [<unknown file> @ <unknown line number>]
+00007FFD3BD0C0DA00007FFD3BC75180 torch_python.dll!torch::lazy::GetPythonFrames [<unknown file> @ <unknown line number>]
+00007FFD3BCCC2B600007FFD3BC75180 torch_python.dll!torch::lazy::GetPythonFrames [<unknown file> @ <unknown line number>]
+00007FFD3B187DBE00007FFD3B1867E0 torch_python.dll!c10::ivalue::Future::devices [<unknown file> @ <unknown line number>]
+00007FFDA421837600007FFDA42178B4 python312.dll!PySet_Add [<unknown file> @ <unknown line number>]
+00007FFDA422BE1800007FFDA422B9BC python312.dll!PyArg_CheckPositional [<unknown file> @ <unknown line number>]
+00007FFDA426286B00007FFDA42626F0 python312.dll!PyObject_Call [<unknown file> @ <unknown line number>]
+00007FFDA41B93B700007FFDA41B931C python312.dll!PyObject_Call [<unknown file> @ <unknown line number>]
+00007FFDA4263C7A00007FFDA42634D0 python312.dll!PyNumber_Long [<unknown file> @ <unknown line number>]
+00007FFDA42631E200007FFDA426305C python312.dll!PyNumber_Negative [<unknown file> @ <unknown line number>]
+00007FFD3B196EA400007FFD3B196D00 torch_python.dll!c10::ivalue::Future::waitAndThrow [<unknown file> @ <unknown line number>]
+00007FFDA423201800007FFDA4231990 python312.dll!PyObject_Vectorcall [<unknown file> @ <unknown line number>]
+00007FFDA42319C500007FFDA4231990 python312.dll!PyObject_Vectorcall [<unknown file> @ <unknown line number>]
+00007FFDA4232EA500007FFDA4232610 python312.dll!PyEval_EvalFrameDefault [<unknown file> @ <unknown line number>]
+00007FFDA41E81E400007FFDA41E7E60 python312.dll!PyObject_ClearManagedDict [<unknown file> @ <unknown line number>]
+00007FFDA41E6B6600007FFDA41E6AB0 python312.dll!PyEval_EvalCode [<unknown file> @ <unknown line number>]
+00007FFDA429E83800007FFDA429DF2C python312.dll!Py_SourceAsString [<unknown file> @ <unknown line number>]
+00007FFDA429EA7000007FFDA429E874 python312.dll!PyModule_ClearDict [<unknown file> @ <unknown line number>]
+00007FFDA427A5D400007FFDA427A4D8 python312.dll!PyDict_DelItemString [<unknown file> @ <unknown line number>]
+00007FFDA427A43200007FFDA427A30C python312.dll!PyRun_SimpleFileObject [<unknown file> @ <unknown line number>]
+00007FFDA427CD1900007FFDA427CCCC python312.dll!PyRun_AnyFileObject [<unknown file> @ <unknown line number>]
+00007FFDA427CEEA00007FFDA427CDD0 python312.dll!PyEval_MakePendingCalls [<unknown file> @ <unknown line number>]
+00007FFDA427CBEB00007FFDA427C988 python312.dll!PyErr_SetExcFromWindowsErrWithFilenameObjects [<unknown file> @ <unknown line number>]
+00007FFDA41D8F1B00007FFDA41D891C python312.dll!PyMem_GetAllocator [<unknown file> @ <unknown line number>]
+00007FFDA41D870000007FFDA41D86E8 python312.dll!Py_RunMain [<unknown file> @ <unknown line number>]
+00007FFDA41D86E300007FFDA41D86B8 python312.dll!Py_Main [<unknown file> @ <unknown line number>]
+00007FF769061230 <unknown symbol address> python.exe!<unknown symbol> [<unknown file> @ <unknown line number>]
+00007FFE158FDDA700007FFE158FDD90 KERNEL32.DLL!BaseThreadInitThunk [<unknown file> @ <unknown line number>]
+00007FFE15BF9C5C00007FFE15BF9C30 ntdll.dll!RtlUserThreadStart [<unknown file> @ <unknown line number>]
+

@@ -1,0 +1,7 @@
+{
+  "master": "192.168.1.137",
+  "port": 29791,
+  "rank": 1,
+  "store_master": false,
+  "world": 3
+}

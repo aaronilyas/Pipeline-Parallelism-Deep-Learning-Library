@@ -1,0 +1,18 @@
+
+--- stderr ---
+/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /Users/runner/work/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+libc++abi: terminating due to uncaught exception of type gloo::EnforceNotMet: [enforce fail at /Users/runner/work/pytorch/pytorch/third_party/gloo/gloo/transport/uv/pair.cc:554] state_ != CONNECTING. 1 vs 1. Cannot close pair while waiting on connection
+Fatal Python error: Aborted
+
+Current thread 0x00000001f8e81300 (most recent call first):
+  File "/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 669 in _create_gloo_process_group
+  File "/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 2874 in _new_process_group_helper
+  File "/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 2553 in init_process_group
+  File "/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py", line 97 in wrapper
+  File "/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py", line 83 in wrapper
+  File "/Users/aaronilyas/ppdl-w-bench/pytorch/rendezvous.py", line 37 in init_gloo
+  File "/Users/aaronilyas/ppdl-w-bench/pytorch/gloo_probe.py", line 33 in main
+  File "/Users/aaronilyas/ppdl-w-bench/pytorch/gloo_probe.py", line 75 in <module>
+
+Extension modules: torch._C, torch._C._dynamo.autograd_compiler, torch._C._dynamo.eval_frame, torch._C._dynamo.guards, torch._C._dynamo.utils, torch._C._fft, torch._C._linalg, torch._C._nested, torch._C._nn, torch._C._sparse, torch._C._special (total: 11)

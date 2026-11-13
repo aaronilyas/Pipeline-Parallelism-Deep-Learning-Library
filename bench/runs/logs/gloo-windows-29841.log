@@ -1,0 +1,7 @@
+
+--- stderr ---
+C:\Users\aaron\ppdl-w-bench\venv\Lib\site-packages\torch\_subclasses\functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\torch\csrc\utils\tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[W1112 19:43:03.000000000 socket.cpp:764] [c10d] The client socket has failed to connect to [Aaron.lan]:29841 (system error: 10049 - The requested address is not valid in its context.).
+
+TIMEOUT

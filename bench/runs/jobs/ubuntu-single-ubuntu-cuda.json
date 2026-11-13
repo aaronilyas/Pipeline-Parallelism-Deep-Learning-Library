@@ -1,0 +1,8 @@
+{
+  "command": "single_host.py device=cuda warmup=5 steps=50",
+  "commit": "51b57a4b6babe8e1ea47e753e5e44b2f0050178a",
+  "device": "cuda",
+  "source_sha256": "0b18848d3c85b394d9e1f2b7f8ed446e78ba4c264d117d410b804c2b8db87300",
+  "steps": 50,
+  "warmup": 5
+}

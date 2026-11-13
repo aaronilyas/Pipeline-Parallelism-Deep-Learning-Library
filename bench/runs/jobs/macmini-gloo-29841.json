@@ -1,0 +1,8 @@
+{
+  "gloo_ifname": "en1",
+  "master": "192.168.1.246",
+  "port": 29841,
+  "rank": 1,
+  "store_master": false,
+  "world": 2
+}

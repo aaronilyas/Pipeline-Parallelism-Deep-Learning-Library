@@ -1,0 +1,17 @@
+
+--- stderr ---
+/home/aaron/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+Fatal Python error: Segmentation fault
+
+Current thread 0x00007fa1bc9ba780 (most recent call first):
+  File "/home/aaron/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 669 in _create_gloo_process_group
+  File "/home/aaron/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 2874 in _new_process_group_helper
+  File "/home/aaron/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 2553 in init_process_group
+  File "/home/aaron/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py", line 97 in wrapper
+  File "/home/aaron/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py", line 83 in wrapper
+  File "/home/aaron/ppdl-w-bench/pytorch/rendezvous.py", line 39 in init_gloo
+  File "/home/aaron/ppdl-w-bench/pytorch/gloo_probe.py", line 33 in main
+  File "/home/aaron/ppdl-w-bench/pytorch/gloo_probe.py", line 75 in <module>
+
+Extension modules: torch._C, torch._C._dynamo.autograd_compiler, torch._C._dynamo.eval_frame, torch._C._dynamo.guards, torch._C._dynamo.utils, torch._C._fft, torch._C._linalg, torch._C._nested, torch._C._nn, torch._C._sparse, torch._C._special, cuda.bindings._bindings.cydriver, cuda.bindings.cydriver, cuda.bindings.driver, cuda.bindings._bindings.cyruntime_ptds, cuda.bindings._bindings.cyruntime, cuda.bindings.cyruntime, cuda.bindings.runtime (total: 18)

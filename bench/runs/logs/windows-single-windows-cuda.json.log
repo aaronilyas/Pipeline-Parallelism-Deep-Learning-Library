@@ -1,0 +1,173 @@
+
+__REPORT__
+{
+  "amp": false,
+  "bytes_sent_per_boundary": [],
+  "command": "single_host.py device=cuda warmup=5 steps=50",
+  "commit": "51b57a4b6babe8e1ea47e753e5e44b2f0050178a",
+  "device_errors": [],
+  "devices": [
+    "cuda"
+  ],
+  "dtype": "float32",
+  "hosts": [
+    {
+      "device": "cuda",
+      "hostname": "Aaron",
+      "platform": "Windows-11-10.0.26300-SP0",
+      "processor": "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel"
+    }
+  ],
+  "kind": "single",
+  "measured_steps": 50,
+  "median_step_s": 0.29998140000679996,
+  "per_step_times_s": [
+    0.2957979000057094,
+    0.2988809999951627,
+    0.2987330000032671,
+    0.2972848000063095,
+    0.2975823000015225,
+    0.2993440999998711,
+    0.2980817999923602,
+    0.29805249997298233,
+    0.3003010000102222,
+    0.2974871000042185,
+    0.299661199998809,
+    0.29847939999308437,
+    0.2985415000002831,
+    0.29994960001204163,
+    0.30034519999753684,
+    0.29927399998996407,
+    0.29937140000401996,
+    0.30041980001260526,
+    0.2997204000130296,
+    0.2992894999915734,
+    0.299702399992384,
+    0.30063719997997396,
+    0.298872899991693,
+    0.30056790000526235,
+    0.3003768000053242,
+    0.2998201999871526,
+    0.3003222999977879,
+    0.30047210000338964,
+    0.3008516999834683,
+    0.3000132000015583,
+    0.30110089998925105,
+    0.300562299991725,
+    0.3013406000100076,
+    0.301231799996458,
+    0.3009852999821305,
+    0.30142309999791905,
+    0.3016988000017591,
+    0.30151849999674596,
+    0.3002142000186723,
+    0.2989250000100583,
+    0.29984000002150424,
+    0.29987160000018775,
+    0.2994600999809336,
+    0.30013819999294356,
+    0.2995500999968499,
+    0.30031469999812543,
+    0.3004806999815628,
+    0.30050959999789484,
+    0.3006409000081476,
+    0.3011922999867238
+  ],
+  "reason": null,
+  "samples_per_sec": 6827.089946088578,
+  "source_sha256": "0b18848d3c85b394d9e1f2b7f8ed446e78ba4c264d117d410b804c2b8db87300",
+  "split": [
+    12
+  ],
+  "split_policy": null,
+  "stack": "pytorch",
+  "status": "ok",
+  "versions": {
+    "amp": false,
+    "cuda_arch_list": [
+      "sm_50",
+      "sm_60",
+      "sm_61",
+      "sm_70",
+      "sm_75",
+      "sm_80",
+      "sm_86",
+      "sm_90"
+    ],
+    "cuda_capability": [
+      8,
+      6
+    ],
+    "cuda_device": "NVIDIA GeForce RTX 3070 Ti Laptop GPU",
+    "cudnn_allow_tf32": true,
+    "dtype": "float32",
+    "gelu": "erf",
+    "layers": 12,
+    "loss": "torch.nn.MSELoss",
+    "lr": 0.001,
+    "matmul_allow_tf32": false,
+    "microbatch_rows": 256,
+    "microbatches": 8,
+    "optimizer": "torch.optim.SGD",
+    "python": "3.12.10",
+    "torch": "2.14.1+cu126",
+    "torch_cuda": "12.6",
+    "width": 4096
+  },
+  "warmup_steps": 5,
+  "workload": "W"
+}
+
+--- stderr ---
+C:\Users\aaron\ppdl-w-bench\venv\Lib\site-packages\torch\_subclasses\functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\torch\csrc\utils\tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+single step 0 0.2958s
+single step 1 0.2989s
+single step 2 0.2987s
+single step 3 0.2973s
+single step 4 0.2976s
+single step 5 0.2993s
+single step 6 0.2981s
+single step 7 0.2981s
+single step 8 0.3003s
+single step 9 0.2975s
+single step 10 0.2997s
+single step 11 0.2985s
+single step 12 0.2985s
+single step 13 0.2999s
+single step 14 0.3003s
+single step 15 0.2993s
+single step 16 0.2994s
+single step 17 0.3004s
+single step 18 0.2997s
+single step 19 0.2993s
+single step 20 0.2997s
+single step 21 0.3006s
+single step 22 0.2989s
+single step 23 0.3006s
+single step 24 0.3004s
+single step 25 0.2998s
+single step 26 0.3003s
+single step 27 0.3005s
+single step 28 0.3009s
+single step 29 0.3000s
+single step 30 0.3011s
+single step 31 0.3006s
+single step 32 0.3013s
+single step 33 0.3012s
+single step 34 0.3010s
+single step 35 0.3014s
+single step 36 0.3017s
+single step 37 0.3015s
+single step 38 0.3002s
+single step 39 0.2989s
+single step 40 0.2998s
+single step 41 0.2999s
+single step 42 0.2995s
+single step 43 0.3001s
+single step 44 0.2996s
+single step 45 0.3003s
+single step 46 0.3005s
+single step 47 0.3005s
+single step 48 0.3006s
+single step 49 0.3012s

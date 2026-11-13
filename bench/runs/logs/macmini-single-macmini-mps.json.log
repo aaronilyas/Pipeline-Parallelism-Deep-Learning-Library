@@ -1,0 +1,159 @@
+
+__REPORT__
+{
+  "amp": false,
+  "bytes_sent_per_boundary": [],
+  "command": "single_host.py device=mps warmup=5 steps=50",
+  "commit": "51b57a4b6babe8e1ea47e753e5e44b2f0050178a",
+  "device_errors": [],
+  "devices": [
+    "mps"
+  ],
+  "dtype": "float32",
+  "hosts": [
+    {
+      "device": "mps",
+      "hostname": "Aarons-Mac-mini-2.local",
+      "platform": "macOS-27.2.1-arm64-arm-64bit",
+      "processor": "arm"
+    }
+  ],
+  "kind": "single",
+  "measured_steps": 50,
+  "median_step_s": 1.1150014790036948,
+  "per_step_times_s": [
+    1.1239706250053132,
+    1.1242375420115422,
+    1.124680291992263,
+    1.1244440419977764,
+    1.1243120420112973,
+    1.124570166997728,
+    1.124326207995182,
+    1.124799625002197,
+    1.124677250001696,
+    1.1248506249976344,
+    1.1239974589989288,
+    1.1244274159980705,
+    1.124494916992262,
+    1.1241844590113033,
+    1.124588875012705,
+    1.1243666250084061,
+    1.144665415995405,
+    1.1140947079984471,
+    1.1150153750058962,
+    1.1150765000056708,
+    1.1156082910019904,
+    1.1152333329955582,
+    1.1154244589997688,
+    1.1154807499988237,
+    1.1153603330021724,
+    1.1370126249967143,
+    1.1116165830026148,
+    1.1128637090005213,
+    1.1114181669981917,
+    1.11231837500236,
+    1.1121055420080665,
+    1.112430207998841,
+    1.1110359170124866,
+    1.112377249999554,
+    1.1112948329973733,
+    1.1120894579944434,
+    1.11168145800184,
+    1.1125056669989135,
+    1.1114288340031635,
+    1.114230375009356,
+    1.1142138339928351,
+    1.1147023750090739,
+    1.1143390829965938,
+    1.1143167500122217,
+    1.1138397500035353,
+    1.1141784170031315,
+    1.114207416001591,
+    1.1149875830014935,
+    1.1146701660036342,
+    1.1149327080056537
+  ],
+  "reason": null,
+  "samples_per_sec": 1836.7688640466938,
+  "source_sha256": "0b18848d3c85b394d9e1f2b7f8ed446e78ba4c264d117d410b804c2b8db87300",
+  "split": [
+    12
+  ],
+  "split_policy": null,
+  "stack": "pytorch",
+  "status": "ok",
+  "versions": {
+    "amp": false,
+    "cudnn_allow_tf32": null,
+    "dtype": "float32",
+    "gelu": "erf",
+    "layers": 12,
+    "loss": "torch.nn.MSELoss",
+    "lr": 0.001,
+    "matmul_allow_tf32": null,
+    "microbatch_rows": 256,
+    "microbatches": 8,
+    "mps": true,
+    "optimizer": "torch.optim.SGD",
+    "python": "3.12.16",
+    "torch": "2.14.1",
+    "torch_cuda": null,
+    "width": 4096
+  },
+  "warmup_steps": 5,
+  "workload": "W"
+}
+
+--- stderr ---
+/Users/aaronilyas/ppdl-w-bench/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /Users/runner/work/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+single step 0 1.1240s
+single step 1 1.1242s
+single step 2 1.1247s
+single step 3 1.1244s
+single step 4 1.1243s
+single step 5 1.1246s
+single step 6 1.1243s
+single step 7 1.1248s
+single step 8 1.1247s
+single step 9 1.1249s
+single step 10 1.1240s
+single step 11 1.1244s
+single step 12 1.1245s
+single step 13 1.1242s
+single step 14 1.1246s
+single step 15 1.1244s
+single step 16 1.1447s
+single step 17 1.1141s
+single step 18 1.1150s
+single step 19 1.1151s
+single step 20 1.1156s
+single step 21 1.1152s
+single step 22 1.1154s
+single step 23 1.1155s
+single step 24 1.1154s
+single step 25 1.1370s
+single step 26 1.1116s
+single step 27 1.1129s
+single step 28 1.1114s
+single step 29 1.1123s
+single step 30 1.1121s
+single step 31 1.1124s
+single step 32 1.1110s
+single step 33 1.1124s
+single step 34 1.1113s
+single step 35 1.1121s
+single step 36 1.1117s
+single step 37 1.1125s
+single step 38 1.1114s
+single step 39 1.1142s
+single step 40 1.1142s
+single step 41 1.1147s
+single step 42 1.1143s
+single step 43 1.1143s
+single step 44 1.1138s
+single step 45 1.1142s
+single step 46 1.1142s
+single step 47 1.1150s
+single step 48 1.1147s
+single step 49 1.1149s

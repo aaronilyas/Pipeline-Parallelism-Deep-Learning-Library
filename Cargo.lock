@@ -316,6 +316,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "linalg-bench"
+version = "0.1.0"
+dependencies = [
+ "linalg-core",
+ "linalg-cpu",
+ "linalg-pipeline",
+ "linalg-transport",
+]
+
+[[package]]
 name = "linalg-core"
 version = "0.1.0"
 

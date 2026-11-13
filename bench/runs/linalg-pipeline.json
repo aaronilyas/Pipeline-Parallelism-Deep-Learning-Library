@@ -1,0 +1,30 @@
+{
+  "workload": "W",
+  "stack": "linalg-pipeline",
+  "status": "not run",
+  "reason": "not run. Workload W is gelu(x @ W + b), mean-squared error, and SGD at 1e-3. linalg_pipeline::train applies gelu(x @ W) and has no bias add. It requires dy before the forward that produces y, so the mean-squared-error gradient of those predictions cannot be formed inside the step. the only multi-rank transport constructor is linalg_transport::localhost_mesh, which built 2 endpoints on 127.0.0.1",
+  "hosts": [{
+    "hostname": "unknown",
+    "role": "local bench process"
+  }],
+  "devices": ["cpu"],
+  "split": null,
+  "versions": {
+    "linalg-pipeline": "0.1.0",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "branch": "main",
+    "git_status": "M Cargo.lock\n M Cargo.toml\n?? bench/\n?? crates/bench/"
+  },
+  "commit": "51b57a4b6babe8e1ea47e753e5e44b2f0050178a",
+  "command": "cargo run -p linalg-bench -- bench/runs/linalg-pipeline.json",
+  "warmup_steps": 5,
+  "measured_steps": 50,
+  "per_step_times_s": [],
+  "median_step_s": null,
+  "samples_per_sec": null,
+  "bytes_sent_per_boundary": [],
+  "layers": 12,
+  "width": 4096,
+  "microbatch_rows": 256,
+  "microbatches": 8
+}

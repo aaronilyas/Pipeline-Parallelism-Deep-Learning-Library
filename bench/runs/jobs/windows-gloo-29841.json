@@ -1,0 +1,8 @@
+{
+  "gloo_ifname": "Wi-Fi",
+  "master": "192.168.1.246",
+  "port": 29841,
+  "rank": 0,
+  "store_master": true,
+  "world": 2
+}

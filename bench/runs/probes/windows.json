@@ -1,0 +1,39 @@
+{
+  "best_device": "cuda",
+  "cpu": "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+  "cuda_arch_list": [
+    "sm_50",
+    "sm_60",
+    "sm_61",
+    "sm_70",
+    "sm_75",
+    "sm_80",
+    "sm_86",
+    "sm_90"
+  ],
+  "cuda_capability": [
+    8,
+    6
+  ],
+  "device_errors": [],
+  "devices_ok": [
+    "cuda",
+    "cpu"
+  ],
+  "gloo_ifname": "Wi-Fi",
+  "gpu": "NVIDIA GeForce RTX 3070 Ti Laptop GPU",
+  "hostname": "Aaron",
+  "ipv4": "192.168.1.246",
+  "machine": "AMD64",
+  "memory_bytes": 16823713792,
+  "native_torch_error": null,
+  "platform": "Windows-11-10.0.26300-SP0",
+  "python": "3.12.10",
+  "runtime": "native",
+  "ssh": "windows",
+  "ssh_system": "WindowsNative",
+  "system": "Windows",
+  "torch": "2.14.1+cu126",
+  "torch_cuda": "12.6",
+  "wsl_distro": null
+}
