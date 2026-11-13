@@ -137,3 +137,18 @@ pub fn localhost_mesh(world: usize) -> Result<Vec<impl Transport>, Error> {
         })
         .collect()
 }
+
+/// Messages a sender may queue per peer before `send` blocks.
+pub const DEFAULT_QUEUE_DEPTH: usize = 4;
+
+/// First four bytes of the `tcp_mesh` handshake.
+pub const HANDSHAKE_MAGIC: [u8; 4] = *b"LNGM";
+
+/// Not yet implemented.
+pub fn tcp_mesh(
+    _rank: usize,
+    _addrs: &[std::net::SocketAddr],
+    _connect_timeout: Duration,
+) -> Result<impl Transport, Error> {
+    Err::<TcpEndpoint, _>(Error::Transport)
+}
