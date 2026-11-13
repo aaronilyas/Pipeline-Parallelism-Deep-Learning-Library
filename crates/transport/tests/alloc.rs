@@ -6,7 +6,6 @@
 use linalg_core::Transport;
 use linalg_transport::tcp_mesh;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::BTreeSet;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -60,7 +59,8 @@ fn recv_into_reuses_capacity_and_steady_state_allocates_nothing() {
     let ep = tcp_mesh(0, &addrs, WAIT).unwrap();
     let payload = vec![0x5Au8; LEN];
     let mut ack = Vec::with_capacity(8);
-    let mut pointers = BTreeSet::new();
+    // Sized up front: the test itself must not allocate in the measured window.
+    let mut pointers = Vec::with_capacity(MEASURED);
     let mut measured_allocs = 0;
     for i in 0..WARMUP + MEASURED {
         if i == WARMUP {
@@ -71,12 +71,14 @@ fn recv_into_reuses_capacity_and_steady_state_allocates_nothing() {
         ep.recv_into(1, &mut ack, WAIT).unwrap();
         assert_eq!(ack, index, "round trip {i}");
         if i >= WARMUP {
-            pointers.insert(ack.as_ptr() as usize);
+            pointers.push(ack.as_ptr() as usize);
             assert!(ack.capacity() <= LEN, "ack buffer grew to {}", ack.capacity());
         }
     }
     let allocs = ALLOCS.load(Ordering::SeqCst) - measured_allocs;
     let _echo = echo.join().unwrap();
+    pointers.sort_unstable();
+    pointers.dedup();
     assert_eq!(allocs, 0, "{allocs} allocations across {MEASURED} steady-state round trips");
     assert!(pointers.len() <= 2, "recv_into handed back {} distinct buffers", pointers.len());
 }

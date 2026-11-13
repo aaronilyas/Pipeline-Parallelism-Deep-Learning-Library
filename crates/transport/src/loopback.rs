@@ -50,12 +50,27 @@ impl Transport for LoopbackEndpoint {
         self.hub.boxes[self.rank * self.hub.world + src].pop_timeout(timeout)
     }
 
-    // Not yet implemented by this transport; see the core contract.
-    fn send_parts(&self, _dest: usize, _parts: &[&[u8]]) -> Result<(), Error> {
-        Err(Error::Transport)
+    /// One allocation holding the concatenation of `parts`, like [`send`](Transport::send).
+    fn send_parts(&self, dest: usize, parts: &[&[u8]]) -> Result<(), Error> {
+        if dest >= self.hub.world || dest == self.rank {
+            return Err(Error::Transport);
+        }
+        let total = parts
+            .iter()
+            .try_fold(0usize, |sum, part| sum.checked_add(part.len()))
+            .ok_or(Error::Transport)?;
+        let mut message = Vec::with_capacity(total);
+        for part in parts {
+            message.extend_from_slice(part);
+        }
+        self.hub.boxes[dest * self.hub.world + self.rank].push(message)
     }
 
-    fn recv_into(&self, _src: usize, _buf: &mut Vec<u8>, _timeout: Duration) -> Result<(), Error> {
-        Err(Error::Transport)
+    /// Copies the message into `buf`, keeping `buf`'s allocation when it is large enough.
+    fn recv_into(&self, src: usize, buf: &mut Vec<u8>, timeout: Duration) -> Result<(), Error> {
+        let message = self.recv_timeout(src, timeout)?;
+        buf.clear();
+        buf.extend_from_slice(&message);
+        Ok(())
     }
 }
