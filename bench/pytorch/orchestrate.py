@@ -9,8 +9,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import platform
-import socket
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -63,7 +61,10 @@ def detect_ifname(host: str, ssh_system: str, ipv4: str) -> str | None:
         command = f"route -n get {ipv4}"
     else:
         command = f"ip -o addr show to {ipv4}"
-    result = ssh(host, command, 30)
+    if ssh_system == "Windows":
+        result = ssh_invoke(host, ssh_system, command, 60)
+    else:
+        result = ssh(host, command, 30)
     if result.returncode != 0:
         return None
     if ssh_system == "Darwin":
@@ -305,10 +306,14 @@ def run_probe(host: str, ssh_system: str) -> dict:
     return info
 
 
-def ensure_host(host: str) -> dict:
+def ensure_host(host: str, force_wsl: bool = False) -> dict:
+    """Probe one host. ``force_wsl`` runs a Windows host inside WSL2 even
+    when native torch imports; the native error is then None."""
     ssh_system = remote_os(host)
     native_error = None
-    if ssh_system == "Windows":
+    if ssh_system == "Windows" and force_wsl:
+        prepare_wsl(host)
+    elif ssh_system == "Windows":
         ok, text = native_torch_text(host)
         if ok:
             ssh_system = "WindowsNative"
@@ -330,10 +335,11 @@ def ensure_host(host: str) -> dict:
     info["runtime"] = "wsl" if ssh_system == "Windows" else "native"
     info["wsl_distro"] = WSL_DISTRO.get(host)
     info["native_torch_error"] = native_error
+    info["label"] = f"{host}-wsl2" if info["runtime"] == "wsl" else host
     if release_of(str(info.get("torch"))) != TORCH_RELEASE:
         raise RuntimeError(f"{host} torch {info.get('torch')} is not {TORCH_RELEASE}")
     (RUNS / "probes").mkdir(parents=True, exist_ok=True)
-    (RUNS / "probes" / f"{host}.json").write_text(dump(info), encoding="utf-8")
+    (RUNS / "probes" / f"{info['label']}.json").write_text(dump(info), encoding="utf-8")
     print(
         f"probe {host} device={info.get('best_device')} torch={info.get('torch')} runtime={info['runtime']} ifname={info.get('gloo_ifname')}",
         flush=True,
@@ -450,7 +456,7 @@ def write_run(name: str, report: dict) -> Path:
 
 def reusable_single(host: dict, device: str, commit: str) -> dict | None:
     """A single-host file from this commit, with all 50 steps, is the measurement."""
-    path = RUNS / f"pytorch-single-{host['ssh']}-{device}.json"
+    path = RUNS / f"pytorch-single-{host.get('label', host['ssh'])}-{device}.json"
     if not path.exists():
         return None
     report = json.loads(path.read_text(encoding="utf-8"))
@@ -499,6 +505,7 @@ def single_runs(hosts: list[dict], commit: str, digest: str, warmup: int, steps:
             "runtime": host.get("runtime"),
             "wsl_distro": host.get("wsl_distro"),
             "native_torch_error": host.get("native_torch_error"),
+            "label": host.get("label", host["ssh"]),
         }
         return report
 
@@ -510,12 +517,13 @@ def single_runs(hosts: list[dict], commit: str, digest: str, warmup: int, steps:
             if kept is not None:
                 reports.append(kept)
                 continue
-            futures.append(pool.submit(one, host, device, f"{host['ssh']}-{device}"))
+            futures.append(pool.submit(one, host, device, f"{host.get('label', host['ssh'])}-{device}"))
         for future in futures:
             report = future.result()
             reports.append(report)
             device_name = (report.get("devices") or ["unknown"])[0] or "unknown"
-            write_run(f"pytorch-single-{report['ssh']}-{device_name}.json", report)
+            label = (report.get("inventory") or {}).get("label") or report["ssh"]
+            write_run(f"pytorch-single-{label}-{device_name}.json", report)
     return reports
 
 
@@ -642,7 +650,7 @@ def pipeline_run(
     rank_reports = []
     for rank, host in enumerate(ordered):
         code, stdout, stderr = finished.get(host["ssh"], (1, "", "missing"))
-        log = RUNS / "logs" / f"pipeline-{policy}-{host['ssh']}.log"
+        log = RUNS / "logs" / f"pipeline-{policy}-{host.get('label', host['ssh'])}.log"
         log.write_text(stdout + "\n--- stderr ---\n" + stderr, encoding="utf-8")
         if "__REPORT__" not in stdout:
             rank_reports.append(
@@ -686,6 +694,7 @@ def merge_pipeline(
         "hosts": [
             {
                 "ssh": host["ssh"],
+                "label": host.get("label", host["ssh"]),
                 "hostname": host.get("hostname"),
                 "cpu": host.get("cpu"),
                 "gpu": host.get("gpu"),
@@ -749,179 +758,6 @@ def merge_pipeline(
     return merged
 
 
-def fmt_num(value: object) -> str:
-    if value is None:
-        return "not run"
-    return json.dumps(value)
-
-
-def results_markdown(
-    singles: list[dict],
-    pipelines: list[dict],
-    gloo: dict,
-    linalg: dict | None,
-    hub: dict,
-    pair_gloos: list[dict] | None = None,
-) -> str:
-    lines = [
-        "# Baseline",
-        "",
-        "Workload W is a 12-layer MLP, `y = gelu(x @ W + b)`, width 4096, float32.",
-        "One step is 8 microbatches of 256 rows, mean-squared error (`torch.nn.MSELoss`),",
-        "and SGD at `1e-3`. Samples/sec is `2048 / median(step time)` over 50 steps after 5 warmup steps.",
-        "The median of an even count is the average of the two central values.",
-        "Pipeline step time is the max across ranks after a gloo barrier.",
-        "Byte counts are the totals sent during the measured steps, one record per stage boundary.",
-        "AMP is off. TF32 is PyTorch's default, recorded in each JSON and not changed.",
-        "Torch release `2.14.1` is installed on every training host.",
-        "The GTX 1080 host uses the CUDA 12.6 wheel (`--index-url https://download.pytorch.org/whl/cu126`).",
-        "The Mac uses the macOS arm64 wheel of the same release. No number here is estimated.",
-        "",
-        "## Hub",
-        "",
-        f"Coordinator `{hub.get('hostname')}` is not a training rank. CPU `{hub.get('cpu')}`. GPU `{hub.get('gpu')}`.",
-        "",
-        "## Single host",
-        "",
-        "| ssh | hostname | device | samples/sec | median step s | status | command | commit |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    for report in singles:
-        device = ",".join(report.get("devices") or []) or "none"
-        lines.append(
-            "| {ssh} | {hostname} | {device} | {samples} | {median} | {status} | `{command}` | `{commit}` |".format(
-                ssh=report.get("ssh"),
-                hostname=(report.get("inventory") or {}).get("hostname"),
-                device=device,
-                samples=fmt_num(report.get("samples_per_sec")),
-                median=fmt_num(report.get("median_step_s")),
-                status=report.get("status"),
-                command=report.get("command"),
-                commit=report.get("commit"),
-            )
-        )
-    notes = [
-        report.get("inventory", {}).get("native_torch_error")
-        for report in singles
-        if (report.get("inventory") or {}).get("native_torch_error")
-    ]
-    if notes:
-        lines.extend(
-            [
-                "",
-                "Native Windows torch did not import. The recorded error is below.",
-                "That host's runs use the WSL distro named in the probe, on the same GPU.",
-                "",
-                "```",
-                str(notes[0])[:4000],
-                "```",
-            ]
-        )
-    lines.extend(["", "## Pipeline", ""])
-    if gloo.get("status") != "ok":
-        lines.append("Gloo did not form a group on the full host set. Attempts:")
-        lines.append("")
-        lines.append("```")
-        lines.append(json.dumps(gloo.get("attempts", gloo.get("reason")), indent=2)[:12000])
-        lines.append("```")
-        lines.append("")
-    lines.append("| policy | hosts | devices | split | samples/sec | median step s | status | commit |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
-    error_notes = []
-    for report in pipelines:
-        hosts = ",".join(str(host.get("ssh")) for host in report.get("hosts") or [])
-        lines.append(
-            "| {policy} | {hosts} | {devices} | `{split}` | {samples} | {median} | {status} | `{commit}` |".format(
-                policy=report.get("split_policy"),
-                hosts=hosts,
-                devices=",".join(str(device) for device in (report.get("devices") or [])),
-                split=report.get("split"),
-                samples=fmt_num(report.get("samples_per_sec")),
-                median=fmt_num(report.get("median_step_s")),
-                status=report.get("status"),
-                commit=report.get("commit"),
-            )
-        )
-        if report.get("status") != "ok" and report.get("rank_errors"):
-            error_notes.append((report.get("split_policy"), hosts, str(report["rank_errors"][0])[:6000]))
-    for policy, hosts, error in error_notes:
-        lines.extend(["", f"Exact error for `{policy}` on {hosts}:", "", "```", error, "```"])
-    if pair_gloos:
-        lines.extend(["", "### Subset groups", ""])
-        lines.append("These groups were tried after the full set did not produce a finished 50-step pipeline.")
-        lines.append("")
-        for report in pair_gloos:
-            names = report.get("names") or "subset"
-            lines.append(f"- `{names}` status `{report.get('status')}` port `{report.get('port')}`")
-            if report.get("status") != "ok":
-                lines.extend(["", "```", json.dumps(report.get("attempts", report.get("reason")), indent=2)[:8000], "```", ""])
-    ok_single = [report for report in singles if report.get("status") == "ok" and report.get("measured_steps") == MEASURED_STEPS]
-    ok_pipe = [report for report in pipelines if report.get("status") == "ok" and report.get("measured_steps") == MEASURED_STEPS]
-    lines.extend(["", "## Chosen baseline", ""])
-    if ok_pipe:
-        chosen = max(ok_pipe, key=lambda report: float(report["samples_per_sec"]))
-        lines.append(
-            f"The baseline is the {chosen['split_policy']} split on "
-            f"{[host.get('ssh') for host in chosen['hosts']]} at {fmt_num(chosen['samples_per_sec'])} samples/sec."
-        )
-        if ok_single:
-            best = max(ok_single, key=lambda report: float(report["samples_per_sec"]))
-            if float(chosen["samples_per_sec"]) < float(best["samples_per_sec"]):
-                lines.append(
-                    f"The pipeline baseline is slower than the best single host: "
-                    f"{fmt_num(chosen['samples_per_sec'])} samples/sec versus "
-                    f"{fmt_num(best['samples_per_sec'])} samples/sec on {best.get('ssh')} "
-                    f"({','.join(best.get('devices') or [])})."
-                )
-            else:
-                lines.append(
-                    f"The pipeline baseline is at least as fast as the best single host "
-                    f"({fmt_num(best['samples_per_sec'])} samples/sec on {best.get('ssh')})."
-                )
-    elif ok_single:
-        best = max(ok_single, key=lambda report: float(report["samples_per_sec"]))
-        lines.append(
-            f"No pipeline finished. The baseline is the fastest PyTorch configuration that ran: "
-            f"{best.get('ssh')} {','.join(best.get('devices') or [])} at {fmt_num(best['samples_per_sec'])} samples/sec."
-        )
-    else:
-        lines.append("No PyTorch configuration finished. There is no samples/sec baseline.")
-    lines.extend(["", "## linalg-pipeline", ""])
-    if linalg is None:
-        lines.append("not run. The bench JSON was not produced.")
-    else:
-        lines.append(f"Status: {linalg.get('status')}.")
-        lines.append("")
-        lines.append(linalg.get("reason") or "")
-        lines.append("")
-        lines.append(f"Command: `{linalg.get('command')}`")
-        lines.append(f"Commit: `{linalg.get('commit')}`")
-    lines.append("")
-    lines.append("Per-step times and byte counts are in `bench/runs/`.")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def hub_inventory() -> dict:
-    cpu = "unknown"
-    try:
-        for line in open("/proc/cpuinfo", encoding="utf-8"):
-            if line.startswith("model name"):
-                cpu = line.split(":", 1)[1].strip()
-                break
-    except OSError:
-        cpu = platform.processor()
-    gpu = "none"
-    try:
-        gpu = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name,compute_cap,memory.total", "--format=csv,noheader"],
-            text=True,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        pass
-    return {"hostname": socket.gethostname(), "cpu": cpu, "gpu": gpu}
-
-
 def measure_set(
     ordered: list[dict],
     singles: list[dict],
@@ -933,9 +769,9 @@ def measure_set(
     policies = [("equal", equal_layers(len(ordered)))]
     speeds = []
     speed_ok = True
-    by_ssh = {report.get("ssh"): report for report in singles}
+    by_label = {(report.get("inventory") or {}).get("label") or report.get("ssh"): report for report in singles}
     for host in ordered:
-        single = by_ssh.get(host["ssh"])
+        single = by_label.get(host.get("label", host["ssh"]))
         device = host["best_device"]
         if (
             single
@@ -946,7 +782,7 @@ def measure_set(
             speeds.append(float(single["samples_per_sec"]))
         else:
             speed_ok = False
-    suffix = "-".join(str(host["ssh"]) for host in ordered)
+    suffix = "-".join(str(host.get("label", host["ssh"])) for host in ordered)
     if speed_ok:
         policies.append(("proportional", proportional_layers(speeds)))
     else:
@@ -957,7 +793,10 @@ def measure_set(
             "split_policy": "proportional",
             "status": "not run",
             "reason": "a host has no single-host samples/sec on its best device, so a proportional split is not measured",
-            "hosts": [{"ssh": host["ssh"], "hostname": host.get("hostname")} for host in ordered],
+            "hosts": [
+                {"ssh": host["ssh"], "label": host.get("label", host["ssh"]), "hostname": host.get("hostname"), "runtime": host.get("runtime")}
+                for host in ordered
+            ],
             "devices": [host.get("best_device") for host in ordered],
             "split": None,
             "commit": commit,
@@ -997,6 +836,8 @@ def measure_set(
             MEASURED_STEPS,
             timeout=60 * 60 * 6,
         )
+        if policy == "proportional":
+            report["split_speeds_samples_per_sec"] = speeds
         pipelines.append(report)
         write_run(f"pytorch-pipeline-{policy}-{suffix}.json", report)
     return pipelines
@@ -1055,12 +896,9 @@ def main() -> int:
                     pipelines.extend(
                         measure_set(sub_gloo["ordered"], singles, int(sub_gloo["port"]) + 1, commit, digest)
                     )
-    linalg_path = RUNS / "linalg-pipeline.json"
-    linalg = json.loads(linalg_path.read_text(encoding="utf-8")) if linalg_path.exists() else None
-    text = results_markdown(singles, pipelines, gloo, linalg, hub_inventory(), pair_gloos)
-    (REPO / "bench" / "RESULTS.md").write_text(text, encoding="utf-8")
-    print(text)
-    return 0
+    import results
+
+    return results.main()
 
 
 if __name__ == "__main__":
