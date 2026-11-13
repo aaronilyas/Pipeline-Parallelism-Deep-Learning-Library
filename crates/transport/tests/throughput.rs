@@ -2,10 +2,13 @@
 //! `TcpStream` `write_all` / `read_exact` loop measured in the same test.
 #![cfg(not(debug_assertions))]
 
+mod common;
+
+use common::free_addrs;
 use linalg_core::Transport;
 use linalg_transport::tcp_mesh;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 const MIB4: usize = 4 << 20;
@@ -37,10 +40,7 @@ fn raw_bytes_per_sec() -> f64 {
 }
 
 fn mesh_bytes_per_sec() -> f64 {
-    let listeners: Vec<TcpListener> =
-        (0..2).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
-    let addrs: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
-    drop(listeners);
+    let addrs = free_addrs(2);
     let a = addrs.clone();
     let receiver = std::thread::spawn(move || {
         let ep = tcp_mesh(1, &a, WAIT).unwrap();

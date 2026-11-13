@@ -25,6 +25,9 @@ pub const DEFAULT_QUEUE_DEPTH: usize = 4;
 /// cannot make it allocate more than the peer sends.
 const GROW_STEP: usize = 1 << 20;
 
+/// How long `Drop` waits for the reader to see end of stream before detaching it.
+const READER_GRACE: Duration = Duration::from_secs(1);
+
 struct Peer {
     outbox: Arc<Outbox>,
     inbox: Arc<Inbox>,
@@ -114,6 +117,9 @@ fn spawn_reader(mut stream: TcpStream, inbox: Arc<Inbox>, outbox: Arc<Outbox>) -
         }
         // The peer is gone (or we are shutting down): later sends fail rather than queue.
         outbox.fail();
+        // Answers the peer's end of stream with ours. Windows does not wake a reader blocked
+        // in `recv` when its own side shuts down, so a dropping peer waits for this.
+        let _ = stream.shutdown(Shutdown::Both);
         inbox.close();
     })
 }
@@ -139,10 +145,14 @@ impl Drop for Peer {
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
         }
-        // Wakes our reader and gives the remote side end of stream.
+        // Gives the remote side end of stream, and wakes our reader on Linux and macOS. On
+        // Windows the reader wakes when the peer answers with its own end of stream; a peer
+        // that never does leaves the reader detached, holding the socket until the OS gives up.
         let _ = self.control.shutdown(Shutdown::Both);
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            if self.inbox.wait_closed(READER_GRACE) {
+                let _ = reader.join();
+            }
         }
     }
 }

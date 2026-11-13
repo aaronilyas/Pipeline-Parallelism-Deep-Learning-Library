@@ -169,6 +169,16 @@ impl Inbox {
         self.ready.notify_all();
     }
 
+    /// Waits up to `timeout` for the reader to close the inbox; returns whether it did.
+    pub(crate) fn wait_closed(&self, timeout: Duration) -> bool {
+        let state = lock(&self.state);
+        let (state, _) = self
+            .ready
+            .wait_timeout_while(state, timeout, |state| !state.closed)
+            .unwrap_or_else(|e| e.into_inner());
+        state.closed
+    }
+
     /// Waits up to `timeout` for the oldest message and hands it to `take` under the lock.
     fn pop_with<R>(
         &self,

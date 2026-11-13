@@ -3,6 +3,9 @@
 //! Multi-process tests re-run this test binary as a child: `child_process_entry` reads its role
 //! from the environment and does nothing when the variables are absent.
 
+mod common;
+
+use common::free_addrs;
 use linalg_core::{Error, Transport};
 use linalg_transport::{tcp_mesh, DEFAULT_QUEUE_DEPTH, HANDSHAKE_MAGIC};
 use std::io::{Read, Write};
@@ -18,13 +21,6 @@ const ADDRS_ENV: &str = "LINALG_TRANSPORT_CHILD_ADDRS";
 const MIB4: usize = 4 << 20;
 const CONNECT: Duration = Duration::from_secs(20);
 const WAIT: Duration = Duration::from_secs(20);
-
-/// Distinct free ports on 127.0.0.1, released before return.
-fn free_addrs(n: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<TcpListener> =
-        (0..n).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
-}
 
 /// Bytes that differ at every offset, so a shifted or reordered message never matches.
 fn pattern(len: usize) -> Vec<u8> {
@@ -388,4 +384,27 @@ fn bad_ranks_on_a_tcp_mesh_endpoint_are_transport_errors() {
     assert_eq!(ep.recv_into(0, &mut buf, short), Err(Error::Transport));
     assert_eq!(ep.recv_into(2, &mut buf, short), Err(Error::Transport));
     assert_eq!(ep.recv_into(1, &mut buf, short), Err(Error::Transport));
+}
+
+#[test]
+fn dropping_an_endpoint_returns_promptly_while_the_peer_lives() {
+    // A peer that speaks the protocol and stays alive.
+    let mut eps = linalg_transport::localhost_mesh(2).unwrap();
+    let b = eps.pop().unwrap();
+    let a = eps.pop().unwrap();
+    a.send(1, b"bye").unwrap();
+    let start = Instant::now();
+    drop(a);
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_secs(2), "drop beside a live peer took {elapsed:?}");
+    assert_eq!(b.recv_timeout(0, WAIT).unwrap(), b"bye".to_vec());
+    assert_eq!(b.recv_timeout(0, WAIT), Err(Error::Transport));
+
+    // A raw peer that never reads and never closes.
+    let (ep, raw) = mesh_with_raw_peer();
+    let start = Instant::now();
+    drop(ep);
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_secs(2), "drop beside a silent peer took {elapsed:?}");
+    drop(raw);
 }

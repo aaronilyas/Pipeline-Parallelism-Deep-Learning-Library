@@ -1,12 +1,18 @@
 //! Steady-state `send_parts` and `recv_into` over `tcp_mesh` allocate nothing, and the
 //! buffer `recv_into` hands back cycles through a fixed pair of allocations.
 //!
+//! Buffer pools grow on demand up to a bound (queue depth + 1 per outbox, 8 per inbox), and
+//! when a pool grows depends on thread timing. A burst in each direction first takes every pool
+//! to its bound, so the measured window is the steady state.
+//!
 //! The only test in this binary, so the counting allocator sees no other test.
 
+mod common;
+
+use common::free_addrs;
 use linalg_core::Transport;
 use linalg_transport::tcp_mesh;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -37,18 +43,23 @@ const WAIT: Duration = Duration::from_secs(20);
 const LEN: usize = 256 << 10;
 const WARMUP: usize = 50;
 const MEASURED: usize = 1000;
+/// More than any pool's bound.
+const BURST: usize = 16;
 
 #[test]
 fn recv_into_reuses_capacity_and_steady_state_allocates_nothing() {
-    let listeners: Vec<TcpListener> =
-        (0..2).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
-    let addrs: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
-    drop(listeners);
+    let addrs = free_addrs(2);
 
     let a = addrs.clone();
     let echo = std::thread::spawn(move || {
         let ep = tcp_mesh(1, &a, WAIT).unwrap();
         let mut buf = Vec::with_capacity(LEN);
+        for _ in 0..BURST {
+            ep.recv_into(0, &mut buf, WAIT).unwrap();
+        }
+        for _ in 0..BURST {
+            ep.send_parts(0, &[&buf[..8]]).unwrap();
+        }
         for _ in 0..WARMUP + MEASURED {
             ep.recv_into(0, &mut buf, WAIT).unwrap();
             assert_eq!(buf.len(), LEN);
@@ -62,6 +73,12 @@ fn recv_into_reuses_capacity_and_steady_state_allocates_nothing() {
     // Sized up front: the test itself must not allocate in the measured window.
     let mut pointers = Vec::with_capacity(MEASURED);
     let mut measured_allocs = 0;
+    for _ in 0..BURST {
+        ep.send_parts(1, &[&payload]).unwrap();
+    }
+    for _ in 0..BURST {
+        ep.recv_into(1, &mut ack, WAIT).unwrap();
+    }
     for i in 0..WARMUP + MEASURED {
         if i == WARMUP {
             measured_allocs = ALLOCS.load(Ordering::SeqCst);

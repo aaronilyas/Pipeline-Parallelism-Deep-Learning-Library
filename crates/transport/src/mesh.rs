@@ -146,10 +146,17 @@ fn dial(addr: SocketAddr, deadline: &Deadline) -> Result<TcpStream, Error> {
             None => TcpStream::connect(addr),
         };
         match attempt {
+            // A dial to a local port nobody listens on yet can connect to itself (TCP
+            // simultaneous open); that is not the peer, so try again.
+            Ok(stream) if is_self_connected(&stream) => std::thread::sleep(RETRY),
             Ok(stream) => return Ok(stream),
             Err(_) => std::thread::sleep(RETRY),
         }
     }
+}
+
+fn is_self_connected(stream: &TcpStream) -> bool {
+    matches!((stream.local_addr(), stream.peer_addr()), (Ok(local), Ok(peer)) if local == peer)
 }
 
 fn accept(listener: &TcpListener, deadline: &Deadline) -> Result<TcpStream, Error> {
