@@ -115,7 +115,7 @@ fn manifest_does_not_depend_on_linalg_cpu() {
 }
 
 #[cfg(feature = "cuda")]
-fn require_device() -> CudaBackend {
+pub(crate) fn require_device() -> CudaBackend {
     match CudaBackend::new() {
         Ok(backend) => {
             assert_eq!(backend.kind(), DeviceKind::Cuda);

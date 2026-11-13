@@ -1100,3 +1100,31 @@ pub fn gemm<T: Element>(
     encode_gemm(ctx, cmd, alpha, a, b, beta, c)?;
     finish(cmd)
 }
+
+/// Non-waiting [`gemm`]: encodes `C = α·A·B + β·C` into a new command buffer on `ctx.queue`,
+/// commits it, and returns it without waiting.
+///
+/// The encoding is [`encode_gemm`]'s, so the kernels, the cached pipeline states, and the
+/// result bits are those of [`gemm`]. Host reads of C are valid once the returned command
+/// buffer (or any later one on the same queue that depends on C) has completed. The
+/// autoreleased objects the encoding creates are released before this returns; the returned
+/// buffer is retained by its owner.
+///
+/// # Errors
+///
+/// As [`encode_gemm`]. On error nothing is committed.
+pub fn gemm_nowait<T: Element>(
+    ctx: &MetalContext,
+    alpha: f32,
+    a: &TensorView<'_, T>,
+    b: &TensorView<'_, T>,
+    beta: f32,
+    c: &TensorView<'_, T>,
+) -> Result<metal::CommandBuffer> {
+    metal::objc::rc::autoreleasepool(|| {
+        let cmd = ctx.queue.new_command_buffer().to_owned();
+        encode_gemm(ctx, &cmd, alpha, a, b, beta, c)?;
+        cmd.commit();
+        Ok(cmd)
+    })
+}

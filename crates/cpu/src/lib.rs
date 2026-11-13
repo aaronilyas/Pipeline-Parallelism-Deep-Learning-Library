@@ -1,8 +1,11 @@
 //! CPU backend for the device-independent linalg contract.
 //!
-//! `gemm`, `gelu`, and `gelu_backward` share one math path in test and release.
-//! Test builds record counters. Release builds of those three functions take no
-//! mutex and perform no atomic.
+//! Every op shares one math path in test and release. Test builds, and builds with the
+//! `debug-counters` feature, record counters. Other builds take no mutex and perform no atomic.
+//!
+//! The training ops (`add_bias`, `bias_grad`, `mse_grad`, `sgd_step`, `convert`) are
+//! sequential `f32` loops in a fixed order. Their bits are the reference that multi-rank CPU
+//! runs must reproduce.
 
 use std::sync::Arc;
 
@@ -73,7 +76,7 @@ impl Identified for CpuStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "debug-counters"))]
 struct Stats {
     allocs: u64,
     downloads: u64,
@@ -82,14 +85,14 @@ struct Stats {
 }
 
 pub struct CpuBackend {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "debug-counters"))]
     stats: std::sync::Mutex<Stats>,
 }
 
 impl CpuBackend {
     pub fn new() -> Self {
         Self {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "debug-counters"))]
             stats: std::sync::Mutex::new(Stats {
                 allocs: 0,
                 downloads: 0,
@@ -100,44 +103,44 @@ impl CpuBackend {
     }
 
     fn bump_allocs(&self) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "debug-counters"))]
         {
             self.stats.lock().expect("cpu stats").allocs += 1;
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "debug-counters")))]
         {
             let _ = self;
         }
     }
 
     fn bump_uploads(&self) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "debug-counters"))]
         {
             self.stats.lock().expect("cpu stats").uploads += 1;
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "debug-counters")))]
         {
             let _ = self;
         }
     }
 
     fn bump_downloads(&self) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "debug-counters"))]
         {
             self.stats.lock().expect("cpu stats").downloads += 1;
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "debug-counters")))]
         {
             let _ = self;
         }
     }
 
     fn record(&self, name: &'static str) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "debug-counters"))]
         {
             self.stats.lock().expect("cpu stats").launches.push(name);
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "debug-counters")))]
         {
             let _ = name;
         }
@@ -322,61 +325,219 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    // Not yet implemented by this backend; see the core contract.
-    fn download_into(&self, _tensor: &Tensor<Self::Store>, _out: &mut [u8]) -> Result<(), Error> {
-        Err(Error::UnsupportedDevice)
+    fn download_into(&self, tensor: &Tensor<Self::Store>, out: &mut [u8]) -> Result<(), Error> {
+        let len = nbytes(tensor.dtype, &tensor.shape)?;
+        if out.len() != len {
+            return Err(Error::Shape);
+        }
+        if !packed_layout(tensor) {
+            return Err(Error::UnsupportedLayout);
+        }
+        if len > tensor.storage.allocation.len() {
+            return Err(Error::Shape);
+        }
+        // SAFETY: `0..len` lies inside the allocation, and no call writes this storage id while
+        // this one reads it (core's caller obligation).
+        let src =
+            unsafe { std::slice::from_raw_parts(tensor.storage.allocation.as_mut_ptr(), len) };
+        out.copy_from_slice(src);
+        self.bump_downloads();
+        Ok(())
     }
 
-    fn upload_into(&self, _bytes: &[u8], _tensor: &mut Tensor<Self::Store>) -> Result<(), Error> {
-        Err(Error::UnsupportedDevice)
+    fn upload_into(&self, bytes: &[u8], tensor: &mut Tensor<Self::Store>) -> Result<(), Error> {
+        let len = nbytes(tensor.dtype, &tensor.shape)?;
+        if bytes.len() != len {
+            return Err(Error::Shape);
+        }
+        if !packed_layout(tensor) {
+            return Err(Error::UnsupportedLayout);
+        }
+        if len > tensor.storage.allocation.len() {
+            return Err(Error::Shape);
+        }
+        // SAFETY: `0..len` lies inside the allocation, `bytes` is caller memory distinct from it,
+        // and no other call touches this storage id while this one writes it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                tensor.storage.allocation.as_mut_ptr(),
+                len,
+            );
+        }
+        self.bump_uploads();
+        Ok(())
     }
 
     fn add_bias(
         &self,
-        _x: &Tensor<Self::Store>,
-        _b: &Tensor<Self::Store>,
-        _y: &mut Tensor<Self::Store>,
+        x: &Tensor<Self::Store>,
+        b: &Tensor<Self::Store>,
+        y: &mut Tensor<Self::Store>,
     ) -> Result<(), Error> {
-        Err(Error::UnsupportedDevice)
+        let (rows, cols) = bias_shapes(x, b, y)?;
+        all_f32(&[x, b, y])?;
+        let b_id = b.storage.storage_id();
+        if b_id == x.storage.storage_id() || b_id == y.storage.storage_id() {
+            return Err(Error::Alias);
+        }
+        packed(&[x, b, y])?;
+        let x_ptr = x.storage.allocation.as_mut_ptr();
+        let b_ptr = b.storage.allocation.as_mut_ptr();
+        let y_ptr = y.storage.allocation.as_mut_ptr();
+        for row in 0..rows {
+            for col in 0..cols {
+                let index = row * cols + col;
+                // SAFETY: `packed` checked every index is in bounds. `y` may be `x`: each element
+                // is read before it is written.
+                unsafe {
+                    let value = load_f32(x_ptr, index) + load_f32(b_ptr, col);
+                    store_f32(y_ptr, index, value);
+                }
+            }
+        }
+        self.record("add-bias");
+        Ok(())
     }
 
     fn bias_grad(
         &self,
-        _dpre: &Tensor<Self::Store>,
-        _db: &mut Tensor<Self::Store>,
+        dpre: &Tensor<Self::Store>,
+        db: &mut Tensor<Self::Store>,
     ) -> Result<(), Error> {
-        Err(Error::UnsupportedDevice)
+        if dpre.shape.len() != 2 || db.shape.len() != 1 || db.shape[0] != dpre.shape[1] {
+            return Err(Error::Shape);
+        }
+        let (rows, cols) = (dpre.shape[0], dpre.shape[1]);
+        all_f32(&[dpre, db])?;
+        if dpre.storage.storage_id() == db.storage.storage_id() {
+            return Err(Error::Alias);
+        }
+        packed(&[dpre, db])?;
+        let d_ptr = dpre.storage.allocation.as_mut_ptr();
+        let b_ptr = db.storage.allocation.as_mut_ptr();
+        if rows == 0 {
+            self.record("bias-grad");
+            return Ok(());
+        }
+        for col in 0..cols {
+            // The reference order: s[j] sums rows 0, 1, ... in turn, then db[j] + s[j].
+            let mut sum = 0.0f32;
+            for row in 0..rows {
+                // SAFETY: in bounds by `packed`.
+                sum += unsafe { load_f32(d_ptr, row * cols + col) };
+            }
+            // SAFETY: in bounds by `packed`; `db` is distinct from `dpre`.
+            unsafe { store_f32(b_ptr, col, load_f32(b_ptr, col) + sum) };
+        }
+        self.record("bias-grad");
+        Ok(())
     }
 
     fn mse_grad(
         &self,
-        _y: &Tensor<Self::Store>,
-        _target: &Tensor<Self::Store>,
-        _dy: &mut Tensor<Self::Store>,
-        _loss: &mut f32,
+        y: &Tensor<Self::Store>,
+        target: &Tensor<Self::Store>,
+        dy: &mut Tensor<Self::Store>,
+        loss: &mut f32,
     ) -> Result<(), Error> {
-        Err(Error::UnsupportedDevice)
+        if target.shape != y.shape || dy.shape != y.shape {
+            return Err(Error::Shape);
+        }
+        let count = numel(&y.shape)?;
+        if count == 0 {
+            return Err(Error::Shape);
+        }
+        all_f32(&[y, target, dy])?;
+        if dy.storage.storage_id() == target.storage.storage_id() {
+            return Err(Error::Alias);
+        }
+        packed(&[y, target, dy])?;
+        let y_ptr = y.storage.allocation.as_mut_ptr();
+        let t_ptr = target.storage.allocation.as_mut_ptr();
+        let d_ptr = dy.storage.allocation.as_mut_ptr();
+        let n = count as f32;
+        let mut sum = 0.0f32;
+        for index in 0..count {
+            // SAFETY: in bounds by `packed`. `dy` may be `y`: the element is read first.
+            unsafe {
+                let d = load_f32(y_ptr, index) - load_f32(t_ptr, index);
+                sum += d * d;
+                store_f32(d_ptr, index, (2.0 * d) / n);
+            }
+        }
+        *loss = sum / n;
+        self.record("mse-grad");
+        Ok(())
     }
 
     fn sgd_step(
         &self,
-        _w: &mut Tensor<Self::Store>,
-        _dw: &mut Tensor<Self::Store>,
-        _lr: f32,
+        w: &mut Tensor<Self::Store>,
+        dw: &mut Tensor<Self::Store>,
+        lr: f32,
     ) -> Result<(), Error> {
-        Err(Error::UnsupportedDevice)
+        if dw.shape != w.shape {
+            return Err(Error::Shape);
+        }
+        let count = numel(&w.shape)?;
+        all_f32(&[w, dw])?;
+        if w.storage.storage_id() == dw.storage.storage_id() {
+            return Err(Error::Alias);
+        }
+        packed(&[w, dw])?;
+        let w_ptr = w.storage.allocation.as_mut_ptr();
+        let g_ptr = dw.storage.allocation.as_mut_ptr();
+        for index in 0..count {
+            // SAFETY: in bounds by `packed`; `w` and `dw` are distinct.
+            unsafe {
+                let step = lr * load_f32(g_ptr, index);
+                store_f32(w_ptr, index, load_f32(w_ptr, index) - step);
+                store_f32(g_ptr, index, 0.0);
+            }
+        }
+        self.record("sgd-step");
+        Ok(())
     }
 
-    fn convert(&self, _x: &Tensor<Self::Store>, _y: &mut Tensor<Self::Store>) -> Result<(), Error> {
-        Err(Error::UnsupportedDevice)
+    fn convert(&self, x: &Tensor<Self::Store>, y: &mut Tensor<Self::Store>) -> Result<(), Error> {
+        if y.shape != x.shape {
+            return Err(Error::Shape);
+        }
+        let count = numel(&x.shape)?;
+        let launch = match (x.dtype, y.dtype) {
+            (DType::F32, DType::BF16) => "convert-f32-bf16",
+            (DType::BF16, DType::F32) => "convert-bf16-f32",
+            _ => return Err(Error::Dtype),
+        };
+        if x.storage.storage_id() == y.storage.storage_id() {
+            return Err(Error::Alias);
+        }
+        packed(&[x, y])?;
+        let x_ptr = x.storage.allocation.as_mut_ptr();
+        let y_ptr = y.storage.allocation.as_mut_ptr();
+        for index in 0..count {
+            // SAFETY: in bounds by `packed`; `x` and `y` are distinct.
+            unsafe {
+                if x.dtype == DType::F32 {
+                    let bits = x_ptr.add(index * 4).cast::<u32>().read_unaligned();
+                    y_ptr.add(index * 2).cast::<u16>().write_unaligned(f32_bits_to_bf16(bits));
+                } else {
+                    let bits = x_ptr.add(index * 2).cast::<u16>().read_unaligned();
+                    y_ptr.add(index * 4).cast::<u32>().write_unaligned(u32::from(bits) << 16);
+                }
+            }
+        }
+        self.record(launch);
+        Ok(())
     }
 
     fn debug_allocs(&self) -> u64 {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "debug-counters"))]
         {
             self.stats.lock().expect("cpu stats").allocs
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "debug-counters")))]
         {
             let _ = self;
             0
@@ -384,11 +545,11 @@ impl Backend for CpuBackend {
     }
 
     fn debug_launches(&self) -> Vec<&'static str> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "debug-counters"))]
         {
             self.stats.lock().expect("cpu stats").launches.clone()
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "debug-counters")))]
         {
             let _ = self;
             Vec::new()
@@ -396,11 +557,11 @@ impl Backend for CpuBackend {
     }
 
     fn debug_downloads(&self) -> u64 {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "debug-counters"))]
         {
             self.stats.lock().expect("cpu stats").downloads
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "debug-counters")))]
         {
             let _ = self;
             0
@@ -408,11 +569,11 @@ impl Backend for CpuBackend {
     }
 
     fn debug_uploads(&self) -> u64 {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "debug-counters"))]
         {
             self.stats.lock().expect("cpu stats").uploads
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "debug-counters")))]
         {
             let _ = self;
             0
@@ -559,6 +720,64 @@ unsafe fn store_bf16(ptr: *mut u8, index: usize, value: f32) {
     ptr.add(index * 2).cast::<u16>().write_unaligned(bits);
 }
 
+/// `F32` to `BF16`: nearest, ties to even; NaN keeps its sign and top payload bits and becomes
+/// quiet. The rounding carry turns the largest finite values into infinity and keeps subnormals.
+fn f32_bits_to_bf16(bits: u32) -> u16 {
+    if bits & 0x7fff_ffff > 0x7f80_0000 {
+        return ((bits >> 16) | 0x0040) as u16;
+    }
+    let lsb = (bits >> 16) & 1;
+    (bits.wrapping_add(0x7fff + lsb) >> 16) as u16
+}
+
+/// Row-major contiguous at offset 0, checked without building the stride vector.
+fn packed_layout<S>(tensor: &Tensor<S>) -> bool {
+    if tensor.offset != 0 || tensor.strides.len() != tensor.shape.len() {
+        return false;
+    }
+    let mut stride = 1usize;
+    for (&extent, &have) in tensor.shape.iter().zip(&tensor.strides).rev() {
+        if have != stride {
+            return false;
+        }
+        stride = stride.wrapping_mul(extent);
+    }
+    true
+}
+
+/// `x` is `[B, N]`, `b` is `[N]`, and `y` is `[B, N]`. Returns `(B, N)`.
+fn bias_shapes(
+    x: &Tensor<CpuStore>,
+    b: &Tensor<CpuStore>,
+    y: &Tensor<CpuStore>,
+) -> Result<(usize, usize), Error> {
+    if x.shape.len() != 2 || y.shape != x.shape || b.shape.len() != 1 || b.shape[0] != x.shape[1] {
+        return Err(Error::Shape);
+    }
+    Ok((x.shape[0], x.shape[1]))
+}
+
+fn all_f32(tensors: &[&Tensor<CpuStore>]) -> Result<(), Error> {
+    if tensors.iter().any(|t| t.dtype != DType::F32) {
+        return Err(Error::Dtype);
+    }
+    Ok(())
+}
+
+/// Row-major contiguous at offset 0 (else `UnsupportedLayout`), and each storage holds the
+/// tensor's bytes (else `Shape`).
+fn packed(tensors: &[&Tensor<CpuStore>]) -> Result<(), Error> {
+    if !tensors.iter().all(|t| packed_layout(t)) {
+        return Err(Error::UnsupportedLayout);
+    }
+    for tensor in tensors {
+        if nbytes(tensor.dtype, &tensor.shape)? > tensor.storage.allocation.len() {
+            return Err(Error::Shape);
+        }
+    }
+    Ok(())
+}
+
 fn prepare_f32_row_major(tensors: &[&Tensor<CpuStore>]) -> Result<usize, Error> {
     for tensor in tensors {
         if tensor.dtype != DType::F32 {
@@ -635,3 +854,6 @@ const _: () = {
 
 #[cfg(test)]
 mod invariants;
+
+#[cfg(test)]
+mod training;

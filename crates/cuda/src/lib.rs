@@ -5,6 +5,8 @@
 
 #[cfg(feature = "cuda")]
 mod device;
+#[cfg(feature = "cuda")]
+mod shared_state;
 
 #[cfg(feature = "cuda")]
 pub use device::{CudaBackend, CudaStore};
@@ -170,3 +172,6 @@ pub use host_stub::{CudaBackend, CudaStore};
 
 #[cfg(test)]
 mod invariants;
+
+#[cfg(all(test, feature = "cuda"))]
+mod training;
