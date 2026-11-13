@@ -4,10 +4,17 @@ Standard library only, so every host runs it with the Python it already has.
 
     linkperf.py server PORT
     linkperf.py client HOST PORT MODE SECONDS
+    linkperf.py count            (receiver side of `nc -l PORT | linkperf.py count`)
+    linkperf.py emit SECONDS     (sender side of `linkperf.py emit S | nc -l PORT`)
 
 MODE ``send`` makes the client the sender (iperf3 default). MODE ``recv``
 makes the server the sender (iperf3 ``-R``), so a host whose firewall
 refuses inbound connections can still be measured in both directions.
+
+MODE ``rawsend`` / ``rawrecv`` skip the header, for a listener that is a
+plain ``nc -l``: macOS's application firewall admits the system-signed
+``/usr/bin/nc`` but not an unsigned Python. ``count`` and ``emit`` are the
+Python ends of that pipe, so the timing and counting stay here.
 
 The sender writes for SECONDS, then closes. The receiver counts payload bytes
 from its first byte to end of stream and prints one JSON line prefixed with
@@ -38,13 +45,17 @@ def send_for(sock: socket.socket, seconds: float) -> int:
 
 
 def receive_all(sock: socket.socket) -> dict:
+    return receive_stream(sock.recv_into)
+
+
+def receive_stream(read_into) -> dict:  # type: ignore[no-untyped-def]
     buffer = bytearray(CHUNK)
     view = memoryview(buffer)
     received = 0
     first = None
     last = None
     while True:
-        count = sock.recv_into(view)
+        count = read_into(view)
         if count == 0:
             break
         now = time.perf_counter()
@@ -98,11 +109,55 @@ def server(port: int) -> int:
     return 0
 
 
+def emit(seconds: float) -> int:
+    """Write zeros to stdout. The clock starts once the pipe and nc buffers
+    are full, that is, once a peer is draining them."""
+    out = sys.stdout.buffer
+    payload = bytes(CHUNK)
+    primed = 0
+    while primed < 8 * 1024 * 1024:
+        out.write(payload)
+        primed += CHUNK
+    sent = 0
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        out.write(payload)
+        sent += CHUNK
+    out.flush()
+    print("__SENT__" + json.dumps({"bytes": sent + primed}), file=sys.stderr, flush=True)
+    return 0
+
+
+def count() -> int:
+    measured = receive_stream(sys.stdin.buffer.readinto)
+    report("nc-pipe", socket.gethostname(), "nc", measured)
+    return 0
+
+
+def connect(host: str, port: int) -> socket.socket:
+    """Retry while a just-started ``nc -l`` is not yet bound."""
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            return socket.create_connection((host, port), timeout=60)
+        except ConnectionRefusedError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.5)
+
+
 def client(host: str, port: int, mode: str, seconds: float) -> int:
-    conn = socket.create_connection((host, port), timeout=60)
+    conn = connect(host, port)
     conn.settimeout(seconds + 120)
     tune(conn)
     with conn:
+        if mode == "rawsend":
+            sent = send_for(conn, seconds)
+            print("__SENT__" + json.dumps({"bytes": sent}), flush=True)
+            return 0
+        if mode == "rawrecv":
+            report("client", conn.getsockname()[0], host, receive_all(conn))
+            return 0
         conn.sendall(HEADER.pack(mode.encode(), seconds))
         if mode == "send":
             sent = send_for(conn, seconds)
@@ -118,6 +173,10 @@ def client(host: str, port: int, mode: str, seconds: float) -> int:
 def main(argv: list[str]) -> int:
     if len(argv) == 3 and argv[1] == "server":
         return server(int(argv[2]))
+    if len(argv) == 2 and argv[1] == "count":
+        return count()
+    if len(argv) == 3 and argv[1] == "emit":
+        return emit(float(argv[2]))
     if len(argv) == 6 and argv[1] == "client":
         return client(argv[2], int(argv[3]), argv[4], float(argv[5]))
     print(__doc__, file=sys.stderr)

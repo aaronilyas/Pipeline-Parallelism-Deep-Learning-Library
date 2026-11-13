@@ -1,8 +1,12 @@
 """Measure TCP throughput both ways for every pair of training hosts.
 
 The hub runs this. Each direction is one 30 s run of linkperf.py. The
-listener is the host that accepts inbound TCP (ubuntu, then macmini);
-the other side connects and either sends or, with ``recv``, receives.
+listener is a host that accepts inbound TCP; the other side connects and
+either sends or, with ``recv``, receives. Only ubuntu admits an inbound
+Python socket: windows (Public profile) and its WSL2 guest drop them, and
+macOS's application firewall drops the unsigned venv Python. So for
+macmini <-> windows the Mac listens with the system-signed /usr/bin/nc,
+piped to linkperf.py, which still does the timing and counting.
 Runs go one at a time so no two measurements share the air or the wire.
 
 Writes bench/runs/link-matrix.json.
@@ -61,13 +65,13 @@ ENDPOINTS: dict[str, dict] = {
     },
 }
 
-# (listener, connector). Every pair of the three training hosts, plus the
-# WSL2 path the same-OS pipeline uses.
+# (listener, connector, listener runs nc). Every pair of the three training
+# hosts, plus the WSL2 path the same-OS pipeline uses.
 PAIRS = [
-    ("ubuntu", "macmini"),
-    ("ubuntu", "windows"),
-    ("macmini", "windows"),
-    ("ubuntu", "windows-wsl"),
+    ("ubuntu", "macmini", False),
+    ("ubuntu", "windows", False),
+    ("macmini", "windows", True),
+    ("ubuntu", "windows-wsl", False),
 ]
 
 
@@ -104,9 +108,9 @@ MEDIUM_COMMANDS = {
 
 MEDIUM_SUMMARY = {
     "ubuntu": "Ethernet, r8169 NIC, negotiated 100 Mb/s full duplex (kernel: 'downshifted')",
-    "macmini": "Wi-Fi 802.11ax (en1), 5 GHz; Ethernet en0 inactive",
-    "windows": "Wi-Fi 6E (Intel AX211), Wi-Fi adapter is the only physical link up",
-    "windows-wsl": "WSL2 mirrored networking over the windows Wi-Fi adapter",
+    "macmini": "Wi-Fi 802.11ax (en1), 5 GHz ch 149 80 MHz; Ethernet en0 inactive",
+    "windows": "Wi-Fi 802.11ax (Intel AX211), 2.4 GHz ch 1; no wired link up",
+    "windows-wsl": "WSL2 mirrored networking over the windows 2.4 GHz Wi-Fi adapter",
 }
 
 
@@ -115,13 +119,21 @@ def medium(alias: str) -> str:
     return (result.stdout + result.stderr).strip()
 
 
-def run_direction(listener: str, connector: str, mode: str, port: int) -> dict:
+def run_direction(listener: str, connector: str, mode: str, port: int, via_nc: bool) -> dict:
     """mode 'send': connector -> listener. mode 'recv': listener -> connector."""
     left = ENDPOINTS[listener]
     right = ENDPOINTS[connector]
     host_ip = probe(left["ssh"])["ipv4"]
-    server_cmd = f"{left['run']} server {port}"
-    client_cmd = f"{right['run']} client {host_ip} {port} {mode} {int(SECONDS)}"
+    if via_nc and mode == "send":
+        server_cmd = f"echo __LISTENING__; nc -l {port} | {left['run']} count"
+        client_mode = "rawsend"
+    elif via_nc:
+        server_cmd = f"echo __LISTENING__; {left['run']} emit {int(SECONDS)} | nc -l {port}"
+        client_mode = "rawrecv"
+    else:
+        server_cmd = f"{left['run']} server {port}"
+        client_mode = mode
+    client_cmd = f"{right['run']} client {host_ip} {port} {client_mode} {int(SECONDS)}"
     started = datetime.now(timezone.utc).isoformat()
     server = subprocess.Popen(
         [*SSH, left["ssh"], server_cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
@@ -145,6 +157,7 @@ def run_direction(listener: str, connector: str, mode: str, port: int) -> dict:
         "from": sender,
         "to": receiver,
         "listener": listener,
+        "listener_tool": "nc -l | linkperf.py" if via_nc else "linkperf.py server",
         "mode": mode,
         "duration_s": SECONDS,
         "started_utc": started,
@@ -178,9 +191,9 @@ def main() -> int:
     media = {alias: medium(alias) for alias in ("ubuntu", "macmini", "windows")}
     runs = []
     port = PORT
-    for listener, connector in PAIRS:
+    for listener, connector, via_nc in PAIRS:
         for mode in ("send", "recv"):
-            record = run_direction(listener, connector, mode, port)
+            record = run_direction(listener, connector, mode, port, via_nc)
             port += 1
             print(
                 f"{record['from']} -> {record['to']}: {record['status']} "
